@@ -5,25 +5,39 @@ import sys
 import getpass
 import tempfile
 import shutil
+import time
 import paramiko
 from datetime import datetime
 from pathlib import Path
-from rich.console import Console
-from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
-from rich.panel import Panel
-from rich.table import Table
 
 from scanner import scanner_containers
 from state import State, Phase
 
 # ─── Configuration ────────────────────────────────────────────────────────────
 
-BASE_DIR     = Path(__file__).parent.parent
+BASE_DIR      = Path(__file__).parent.parent
 TERRAFORM_DIR = BASE_DIR / "terraform"
 ANSIBLE_DIR   = BASE_DIR / "ansible"
 SSH_KEY       = Path.home() / ".ssh" / "migration_key"
 
-console = Console()
+
+# ─── Affichage ────────────────────────────────────────────────────────────────
+
+def titre(etape: str, total: int, texte: str):
+    print(f"\n[{etape}/{total}] {texte}")
+    print("-" * 50)
+
+
+def ok(texte: str):
+    print(f"  {texte:.<40} OK")
+
+
+def fail(texte: str):
+    print(f"  {texte:.<40} ECHEC")
+
+
+def info(texte: str):
+    print(f"  {texte}")
 
 
 # ─── Utilitaires ──────────────────────────────────────────────────────────────
@@ -38,26 +52,29 @@ def executer_cmd(commande: list, cwd=None) -> subprocess.CompletedProcess:
     )
 
 
-def afficher_titre(texte: str):
-    console.print(Panel(f"[bold cyan]{texte}[/bold cyan]", expand=False))
-
-
-def afficher_succes(texte: str):
-    console.print(f"  [bold green]✓[/bold green] {texte}")
-
-
-def afficher_erreur(texte: str):
-    console.print(f"  [bold red]✗[/bold red] {texte}")
-
-
-def afficher_info(texte: str):
-    console.print(f"  [yellow]→[/yellow] {texte}")
+def attendre_ssh(ip: str, timeout: int = 120):
+    debut = time.time()
+    while time.time() - debut < timeout:
+        try:
+            client = paramiko.SSHClient()
+            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            client.connect(
+                hostname=ip,
+                username="ubuntu",
+                key_filename=str(SSH_KEY),
+                timeout=5
+            )
+            client.close()
+            return True
+        except Exception:
+            time.sleep(5)
+    return False
 
 
 # ─── Prérequis ────────────────────────────────────────────────────────────────
 
 def verifier_prerequis():
-    afficher_titre("Vérification des prérequis")
+    titre("1", "9", "Verification des prerequis")
     erreurs = []
 
     outils = {
@@ -68,71 +85,67 @@ def verifier_prerequis():
     for nom, cmd in outils.items():
         r = executer_cmd(cmd)
         if r.returncode == 0:
-            afficher_succes(f"{nom} disponible")
+            ok(nom)
         else:
-            afficher_erreur(f"{nom} introuvable")
+            fail(nom)
             erreurs.append(nom)
 
-    if not SSH_KEY.exists():
-        afficher_erreur(f"Clé SSH introuvable : {SSH_KEY}")
-        erreurs.append("ssh_key")
+    if SSH_KEY.exists():
+        ok("cle SSH")
     else:
-        afficher_succes("Clé SSH présente")
+        fail("cle SSH")
+        erreurs.append("ssh_key")
 
     r = executer_cmd(["ping", "-c", "1", "-W", "2", "10.0.0.10"])
     if r.returncode == 0:
-        afficher_succes("vm-cible (OpenStack) joignable")
+        ok("vm-cible (OpenStack)")
     else:
-        afficher_erreur("vm-cible (OpenStack) non joignable")
+        fail("vm-cible (OpenStack)")
         erreurs.append("openstack")
 
     if erreurs:
-        console.print(f"\n[red]Prérequis manquants : {erreurs}[/red]")
+        print(f"\n  Prerequis manquants : {erreurs}")
         sys.exit(1)
 
 
 # ─── Collecte des credentials ─────────────────────────────────────────────────
 
 def collecter_credentials() -> dict:
-    afficher_titre("Collecte des credentials")
-    console.print("  Les credentials ne seront jamais affichés ni loggés.\n")
+    titre("2", "9", "Collecte des credentials")
+    print("  Les credentials ne seront jamais affiches ni logges.\n")
+
+    os_username = input("  Utilisateur OpenStack [migration-user] : ").strip() or "migration-user"
+    os_project  = input("  Projet OpenStack [migration] : ").strip() or "migration"
 
     return {
-        "os_password":           getpass.getpass("  Mot de passe OpenStack (admin) : "),
-        "mariadb_root_password": getpass.getpass("  Mot de passe MariaDB (root)    : "),
-        "mariadb_app_password":  getpass.getpass("  Mot de passe MariaDB (appuser) : "),
+        "os_username":           os_username,
+        "os_project":            os_project,
+        "os_password":           getpass.getpass("  Mot de passe OpenStack : "),
+        "mariadb_root_password": getpass.getpass("  Mot de passe MariaDB root : "),
+        "mariadb_app_password":  getpass.getpass("  Mot de passe MariaDB appuser : "),
     }
 
 
-# ─── Phase 1 : Scan ───────────────────────────────────────────────────────────
+# ─── Phase Scan ───────────────────────────────────────────────────────────────
 
 def phase_scan(state: State) -> list:
-    afficher_titre("Phase 1 : Scan des containers LXC")
+    titre("3", "9", "Scan des containers LXC")
 
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        BarColumn(),
-        TaskProgressColumn(),
-        console=console
-    ) as progress:
-        task = progress.add_task("Scan en cours...", total=5)
+    containers = scanner_containers()
 
-        containers = scanner_containers()
-
-        for c in containers:
-            progress.advance(task)
-            afficher_info(f"{c.name} ({c.ip}) → services : {c.services}")
+    for c in containers:
+        services_str = ", ".join(c.services) if c.services else "aucun"
+        info(f"{c.name} ({c.ip}) ......... services : {services_str}")
+        if c.databases:
+            info(f"  bases : {', '.join(d.name for d in c.databases)}")
 
     state.phase_terminee(Phase.SCAN)
     return containers
 
 
-# ─── Phase 2 : Génération terraform.tfvars ────────────────────────────────────
+# ─── Phase Terraform ──────────────────────────────────────────────────────────
 
 def generer_tfvars(containers: list, credentials: dict):
-    afficher_titre("Phase 2 : Génération terraform.tfvars")
-
     ip_map = {
         "mariadb": "10.10.10.10",
         "apache":  "10.10.10.20",
@@ -156,9 +169,9 @@ def generer_tfvars(containers: list, credentials: dict):
         instances_hcl += f'  {nom} = {{ internal_ip = "{ip}", flavor = "{flavor_map[nom]}" }}\n'
 
     tfvars = f"""os_auth_url     = "http://10.0.0.10:5000/v3"
-os_username     = "admin"
+os_username     = "{credentials['os_username']}"
 os_password     = "{credentials['os_password']}"
-os_project_name = "admin"
+os_project_name = "{credentials['os_project']}"
 os_region       = "RegionOne"
 
 provider_network       = "provider"
@@ -174,61 +187,76 @@ instances = {{
 
     tfvars_path = TERRAFORM_DIR / "terraform.tfvars"
     tfvars_path.write_text(tfvars)
-    afficher_succes(f"terraform.tfvars généré : {tfvars_path}")
 
 
-# ─── Phase 3 : Provisioning Terraform ────────────────────────────────────────
+def phase_provisioning(state: State, credentials: dict):
+    titre("4", "9", "Provisioning Terraform")
 
-def phase_provisioning(state: State):
-    afficher_titre("Phase 3 : Provisioning Terraform")
+    generer_tfvars([], credentials)
 
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        console=console
-    ) as progress:
+    info("terraform init...")
+    r = executer_cmd(["terraform", "init", "-no-color"], cwd=TERRAFORM_DIR)
+    if r.returncode != 0:
+        fail("terraform init")
+        raise Exception("terraform init echoue")
+    ok("terraform init")
 
-        task = progress.add_task("terraform init...", total=None)
-        r = executer_cmd(["terraform", "init", "-no-color"], cwd=TERRAFORM_DIR)
-        if r.returncode != 0:
-            afficher_erreur(r.stderr)
-            raise Exception("terraform init échoué")
-        progress.update(task, description="terraform apply...")
-
-        r = executer_cmd(
-            ["terraform", "apply", "-auto-approve", "-no-color"],
-            cwd=TERRAFORM_DIR
-        )
-        if r.returncode != 0:
-            afficher_erreur(r.stderr)
-            raise Exception("terraform apply échoué")
-
-    afficher_succes("Infrastructure créée")
-
+    info("terraform apply...")
     r = executer_cmd(
-        ["terraform", "output", "-json"],
+        ["terraform", "apply", "-auto-approve", "-no-color"],
         cwd=TERRAFORM_DIR
     )
+    if r.returncode != 0:
+        fail("terraform apply")
+        raise Exception(f"terraform apply echoue:\n{r.stderr[-500:]}")
+    ok("terraform apply")
+
+    r = executer_cmd(["terraform", "output", "-json"], cwd=TERRAFORM_DIR)
     outputs = json.loads(r.stdout)
     instances = outputs["instances"]["value"]
+
+    lxc_ips = {
+        "mariadb": "10.0.3.10",
+        "apache":  "10.0.3.20",
+        "backup":  "10.0.3.30",
+        "ftp":     "10.0.3.40",
+        "nfs":     "10.0.3.50",
+    }
 
     for nom, data in instances.items():
         state.enregistrer_ip(
             nom,
-            lxc_ip=f"10.0.3.{['mariadb','apache','backup','ftp','nfs'].index(nom)*10+10}",
+            lxc_ip=lxc_ips.get(nom, ""),
             internal_ip=data["internal_ip"],
             floating_ip=data["floating_ip"]
         )
-        afficher_info(f"{nom} → internal: {data['internal_ip']} floating: {data['floating_ip']}")
+        info(f"  {nom:.<20} {data['internal_ip']} -> {data['floating_ip']}")
+
+    # Supprime terraform.tfvars (contient le mot de passe)
+    tfvars_path = TERRAFORM_DIR / "terraform.tfvars"
+    if tfvars_path.exists():
+        tfvars_path.unlink()
+        info("  terraform.tfvars supprime (securite)")
+
+    # Attente SSH sur toutes les instances
+    info("")
+    info("Attente SSH sur les instances...")
+    for nom, data in instances.items():
+        ip = data["floating_ip"]
+        if attendre_ssh(ip):
+            ok(f"SSH {nom} ({ip})")
+        else:
+            fail(f"SSH {nom} ({ip})")
+            raise Exception(f"SSH timeout sur {nom} ({ip})")
 
     state.phase_terminee(Phase.PROVISIONING)
     return instances
 
 
-# ─── Phase 4 : Génération inventaire Ansible ──────────────────────────────────
+# ─── Phase Inventaire Ansible ─────────────────────────────────────────────────
 
 def generer_inventaire(instances: dict, containers: list):
-    afficher_titre("Phase 4 : Génération inventaire Ansible")
+    titre("5", "9", "Generation inventaire Ansible")
 
     inventory = ""
     for nom, data in instances.items():
@@ -238,7 +266,7 @@ def generer_inventaire(instances: dict, containers: list):
 
     inv_path = ANSIBLE_DIR / "inventory.ini"
     inv_path.write_text(inventory)
-    afficher_succes(f"inventory.ini généré : {inv_path}")
+    ok("inventory.ini")
 
     container_map = {c.name: c for c in containers}
     for nom, data in instances.items():
@@ -275,86 +303,85 @@ def generer_inventaire(instances: dict, containers: list):
         hv_path.write_text(
             "---\n" + "\n".join(f"{k}: {json.dumps(v)}" for k, v in host_vars.items())
         )
-        afficher_succes(f"host_vars/{data['floating_ip']}.yml généré")
+        ok(f"host_vars {nom}")
 
 
-# ─── Phase 5 : Backup ─────────────────────────────────────────────────────────
+# ─── Phase Backup ─────────────────────────────────────────────────────────────
 
 def phase_backup(containers: list, credentials: dict):
-    afficher_titre("Phase 5 : Backup des containers LXC")
+    titre("6", "9", "Backup des containers LXC")
 
-    tmp_dir = tempfile.mkdtemp(mode=0o700)
-    afficher_info(f"Répertoire temporaire : {tmp_dir}")
+    tmp_dir = tempfile.mkdtemp()
+    os.chmod(tmp_dir, 0o700)
+    info(f"Repertoire temporaire : {tmp_dir}")
 
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        BarColumn(),
-        TaskProgressColumn(),
-        console=console
-    ) as progress:
-        task = progress.add_task("Backup en cours...", total=len(containers))
+    for c in containers:
+        info(f"Backup {c.name}...")
 
-        for c in containers:
-            afficher_info(f"Backup {c.name}...")
-
-            if "mariadb" in c.services:
-                for db in c.databases:
-                    r = executer_cmd([
-                        "sudo", "lxc-attach", "-n", c.name, "--",
-                        "mysqldump", "-u", "root",
-                        f"-p{credentials['mariadb_root_password']}",
-                        db.name
-                    ])
-                    if r.returncode == 0:
-                        dump_path = os.path.join(tmp_dir, f"{db.name}.sql")
-                        with open(dump_path, "w") as f:
-                            f.write(r.stdout)
-                        afficher_succes(f"Dump {db.name} OK")
-
-            if "apache2" in c.services:
-                executer_cmd([
-                    "sudo", "tar", "-czf",
-                    os.path.join(tmp_dir, "html.tar.gz"),
-                    "-C", f"/var/lib/lxc/{c.name}/rootfs/var/www",
-                    "html"
+        if "mariadb" in c.services:
+            for db in c.databases:
+                r = executer_cmd([
+                    "sudo", "lxc-attach", "-n", c.name, "--",
+                    "mysqldump", "-u", "root",
+                    f"-p{credentials['mariadb_root_password']}",
+                    db.name
                 ])
-                executer_cmd([
+                if r.returncode == 0:
+                    dump_path = os.path.join(tmp_dir, f"{db.name}.sql")
+                    with open(dump_path, "w") as f:
+                        f.write(r.stdout)
+                    ok(f"dump {db.name}")
+                else:
+                    fail(f"dump {db.name}")
+
+        if "apache2" in c.services:
+            r = executer_cmd([
+                "sudo", "tar", "-czf",
+                os.path.join(tmp_dir, "html.tar.gz"),
+                "-C", f"/var/lib/lxc/{c.name}/rootfs/var/www",
+                "html"
+            ])
+            if r.returncode == 0:
+                ok("archive /var/www/html")
+            r = executer_cmd([
+                "sudo", "tar", "-czf",
+                os.path.join(tmp_dir, "apache2.tar.gz"),
+                "-C", f"/var/lib/lxc/{c.name}/rootfs/etc",
+                "apache2"
+            ])
+            if r.returncode == 0:
+                ok("archive /etc/apache2")
+
+        if "vsftpd" in c.services:
+            for u in c.ftp_users:
+                username = u.username
+                home_rel = u.home.lstrip("/")
+                r = executer_cmd([
                     "sudo", "tar", "-czf",
-                    os.path.join(tmp_dir, "apache2.tar.gz"),
-                    "-C", f"/var/lib/lxc/{c.name}/rootfs/etc",
-                    "apache2"
+                    os.path.join(tmp_dir, f"ftp_{username}.tar.gz"),
+                    "-C", f"/var/lib/lxc/{c.name}/rootfs/{home_rel}",
+                    "."
                 ])
+                if r.returncode == 0:
+                    ok(f"archive ftp {username}")
 
-            if "vsftpd" in c.services:
-                for u in c.ftp_users:
-                    username = u.username
-                    home_rel = u.home.lstrip("/")
-                    executer_cmd([
-                        "sudo", "tar", "-czf",
-                        os.path.join(tmp_dir, f"ftp_{username}.tar.gz"),
-                        "-C", f"/var/lib/lxc/{c.name}/rootfs/{home_rel}",
-                        "."
-                    ])
+        if "nfs-server" in c.services:
+            r = executer_cmd([
+                "sudo", "tar", "-czf",
+                os.path.join(tmp_dir, "nfs_shared.tar.gz"),
+                "-C", f"/var/lib/lxc/{c.name}/rootfs/srv/nfs",
+                "shared"
+            ])
+            if r.returncode == 0:
+                ok("archive /srv/nfs/shared")
 
-            if "nfs-server" in c.services:
-                executer_cmd([
-                    "sudo", "tar", "-czf",
-                    os.path.join(tmp_dir, "nfs_shared.tar.gz"),
-                    "-C", f"/var/lib/lxc/{c.name}/rootfs/srv/nfs",
-                    "shared"
-                ])
-
-            progress.advance(task)
-
-    afficher_succes("Backup terminé")
     return tmp_dir
 
 
-# ─── Phase 6 : Transfert ──────────────────────────────────────────────────────
+# ─── Phase Transfert ──────────────────────────────────────────────────────────
 
-def phase_transfert(instances: dict, tmp_dir: str):
-    afficher_titre("Phase 6 : Transfert des archives")
+def phase_transfert(instances: dict, tmp_dir: str, state: State):
+    titre("7", "9", "Transfert des archives")
 
     service_files = {
         "mariadb": ["app_db.sql", "sysmonitor.sql"],
@@ -364,91 +391,86 @@ def phase_transfert(instances: dict, tmp_dir: str):
         "backup":  [],
     }
 
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        BarColumn(),
-        TaskProgressColumn(),
-        console=console
-    ) as progress:
-        task = progress.add_task("Transfert...", total=len(instances))
+    for nom, data in instances.items():
+        floating_ip = data["floating_ip"]
+        fichiers = service_files.get(nom, [])
 
-        for nom, data in instances.items():
-            floating_ip = data["floating_ip"]
-            fichiers = service_files.get(nom, [])
+        if not fichiers:
+            continue
 
-            if not fichiers:
-                progress.advance(task)
-                continue
+        info(f"Transfert vers {nom} ({floating_ip})...")
 
-            client = paramiko.SSHClient()
-            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-            client.connect(
-                hostname=floating_ip,
-                username="ubuntu",
-                key_filename=str(SSH_KEY)
-            )
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        client.connect(
+            hostname=floating_ip,
+            username="ubuntu",
+            key_filename=str(SSH_KEY),
+            timeout=30
+        )
 
-            client.exec_command("mkdir -p /tmp/migration")
-            sftp = client.open_sftp()
+        client.exec_command("mkdir -p /tmp/migration")
+        sftp = client.open_sftp()
 
-            for fichier in fichiers:
-                src = os.path.join(tmp_dir, fichier)
-                if os.path.exists(src):
-                    sftp.put(src, f"/tmp/migration/{fichier}")
-                    afficher_succes(f"{fichier} → {nom} ({floating_ip})")
+        for fichier in fichiers:
+            src = os.path.join(tmp_dir, fichier)
+            if os.path.exists(src):
+                sftp.put(src, f"/tmp/migration/{fichier}")
+                ok(f"{fichier} -> {nom}")
+            else:
+                fail(f"{fichier} introuvable")
 
-            sftp.close()
-            client.close()
-            progress.advance(task)
+        sftp.close()
+        client.close()
 
     shutil.rmtree(tmp_dir)
-    afficher_succes("Répertoire temporaire supprimé")
+    info("Repertoire temporaire supprime")
+    state.phase_terminee(Phase.BACKUP)
 
 
-# ─── Phase 7 : Ansible ────────────────────────────────────────────────────────
+# ─── Phase Ansible ────────────────────────────────────────────────────────────
 
-def lancer_ansible(playbook: str, inventaire: str):
-    r = executer_cmd([
+def lancer_ansible(playbook: str, inventaire: str, extra_vars: dict = None):
+    cmd = [
         "ansible-playbook",
         playbook,
         "-i", inventaire,
         "--ssh-extra-args", "-o StrictHostKeyChecking=no"
-    ])
+    ]
+    if extra_vars:
+        cmd += ["--extra-vars", json.dumps(extra_vars)]
+
+    r = subprocess.run(cmd, shell=False, capture_output=True, text=True)
     if r.returncode != 0:
-        raise Exception(f"Ansible {playbook} échoué :\n{r.stderr}")
+        raise Exception(f"Ansible echoue :\n{r.stderr[-500:]}\n{r.stdout[-500:]}")
     return r
 
 
-def phase_ansible(state: State, etape: str, playbook: str):
-    afficher_titre(f"Phase Ansible : {etape}")
+def phase_ansible(state: State, phase: Phase, etape_num: str,
+                   etape_nom: str, playbook: str, extra_vars: dict = None):
+    titre(etape_num, "9", etape_nom)
     inventaire = str(ANSIBLE_DIR / "inventory.ini")
 
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        console=console
-    ) as progress:
-        progress.add_task(f"ansible-playbook {playbook}...", total=None)
-        lancer_ansible(str(ANSIBLE_DIR / playbook), inventaire)
-
-    afficher_succes(f"{etape} terminé")
+    info(f"ansible-playbook {playbook}...")
+    lancer_ansible(str(ANSIBLE_DIR / playbook), inventaire, extra_vars)
+    ok(etape_nom)
+    state.phase_terminee(phase)
 
 
 # ─── Rollback ─────────────────────────────────────────────────────────────────
 
 def rollback(state: State, erreur: str):
-    afficher_erreur(f"Erreur : {erreur}")
-    afficher_info("Rollback en cours...")
+    print(f"\n  ERREUR : {erreur}")
+    print("  Rollback en cours...")
 
     r = executer_cmd(
         ["terraform", "destroy", "-auto-approve", "-no-color"],
         cwd=TERRAFORM_DIR
     )
     if r.returncode == 0:
-        afficher_succes("Ressources OpenStack supprimées")
+        ok("Ressources OpenStack supprimees")
     else:
-        afficher_erreur("Terraform destroy échoué — vérification manuelle nécessaire")
+        fail("terraform destroy")
 
     state.marquer_echec(erreur)
 
@@ -456,67 +478,39 @@ def rollback(state: State, erreur: str):
 # ─── Rapport final ────────────────────────────────────────────────────────────
 
 def generer_rapport(state: State, instances: dict):
-    afficher_titre("Rapport final")
+    titre("9", "9", "Rapport final")
 
     rapport = {
         "migration_date": datetime.now().isoformat(),
         "status": "success",
         "duree_secondes": (datetime.now() - datetime.fromisoformat(state.debut)).seconds,
         "instances": {},
-        "dns_records_to_update": [],
-        "load_balancer_pool": [],
     }
 
+    print(f"\n  {'Service':<12} {'Ancienne IP':<16} {'IP interne':<16} {'Floating IP':<16}")
+    print(f"  {'-'*12} {'-'*16} {'-'*16} {'-'*16}")
+
     for nom, data in instances.items():
+        lxc_ip = state.ip_mapping.get(nom, {}).get("lxc_ip", "")
         rapport["instances"][nom] = {
-            "old_lxc_ip":   state.ip_mapping.get(nom, {}).get("lxc_ip", ""),
+            "old_lxc_ip":   lxc_ip,
             "internal_ip":  data["internal_ip"],
             "floating_ip":  data["floating_ip"],
             "validation":   "passed"
         }
-
-    rapport["dns_records_to_update"].append({
-        "name": "SysMonitor.migration.local",
-        "old_ip": state.ip_mapping.get("apache", {}).get("lxc_ip", ""),
-        "new_ip": instances.get("apache", {}).get("floating_ip", "")
-    })
-
-    rapport["load_balancer_pool"].append({
-        "service": "apache",
-        "floating_ip": instances.get("apache", {}).get("floating_ip", ""),
-        "internal_ip": instances.get("apache", {}).get("internal_ip", ""),
-        "port": 80
-    })
+        print(f"  {nom:<12} {lxc_ip:<16} {data['internal_ip']:<16} {data['floating_ip']:<16}")
 
     rapport_path = BASE_DIR / "migration_report.json"
     rapport_path.write_text(json.dumps(rapport, indent=2))
-
-    table = Table(title="Résumé de la migration")
-    table.add_column("Service", style="cyan")
-    table.add_column("Ancienne IP LXC", style="red")
-    table.add_column("IP interne", style="green")
-    table.add_column("Floating IP", style="green")
-
-    for nom, data in instances.items():
-        table.add_row(
-            nom,
-            state.ip_mapping.get(nom, {}).get("lxc_ip", ""),
-            data["internal_ip"],
-            data["floating_ip"]
-        )
-
-    console.print(table)
-    afficher_succes(f"Rapport écrit : {rapport_path}")
+    print(f"\n  Rapport ecrit : {rapport_path}")
+    print("\n=== Migration terminee avec succes ===\n")
 
 
 # ─── Point d'entrée ───────────────────────────────────────────────────────────
 
 def main():
-    console.print(Panel.fit(
-        "[bold cyan]Migration LXC → OpenStack[/bold cyan]\n"
-        "[dim]PFE Master — Automatisation complète[/dim]",
-        border_style="cyan"
-    ))
+    print("\n=== Migration LXC -> OpenStack ===")
+    print("    PFE Master - Automatisation complete\n")
 
     state = State.charger()
     instances = {}
@@ -531,8 +525,7 @@ def main():
             containers = scanner_containers()
 
         if state.phase.value <= Phase.PROVISIONING.value:
-            generer_tfvars(containers, credentials)
-            instances = phase_provisioning(state)
+            instances = phase_provisioning(state, credentials)
             generer_inventaire(instances, containers)
         else:
             r = executer_cmd(["terraform", "output", "-json"], cwd=TERRAFORM_DIR)
@@ -540,20 +533,19 @@ def main():
 
         if state.phase.value <= Phase.BACKUP.value:
             tmp_dir = phase_backup(containers, credentials)
-            phase_transfert(instances, tmp_dir)
-            state.phase_terminee(Phase.BACKUP)
+            phase_transfert(instances, tmp_dir, state)
 
         if state.phase.value <= Phase.PROVISION.value:
-            phase_ansible(state, "Provisionnement logiciel", "provision.yml")
-            state.phase_terminee(Phase.PROVISION)
+            phase_ansible(state, Phase.PROVISION, "8a", "Provisionnement logiciel", "provision.yml")
 
         if state.phase.value <= Phase.RESTORE.value:
-            phase_ansible(state, "Restauration des services", "restore.yml")
-            state.phase_terminee(Phase.RESTORE)
+            phase_ansible(
+                state, Phase.RESTORE, "8b", "Restauration des services", "restore.yml",
+                extra_vars={"mariadb_appuser_password": credentials["mariadb_app_password"]}
+            )
 
         if state.phase.value <= Phase.VALIDATE.value:
-            phase_ansible(state, "Validation interne", "validate.yml")
-            state.phase_terminee(Phase.VALIDATE)
+            phase_ansible(state, Phase.VALIDATE, "8c", "Validation interne", "validate.yml")
 
         state.marquer_termine()
         generer_rapport(state, instances)
