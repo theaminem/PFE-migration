@@ -20,7 +20,11 @@ BASE_DIR      = Path(__file__).parent.parent
 TERRAFORM_DIR = BASE_DIR / "terraform"
 ANSIBLE_DIR   = BASE_DIR / "ansible"
 
-CONFIG  = yaml.safe_load((BASE_DIR / "config.yml").open())
+config_path = BASE_DIR / "config.yml"
+if not config_path.exists():
+    print("  ERREUR : config.yml introuvable. Copie config.yml.example et adapte-le.")
+    sys.exit(1)
+CONFIG  = yaml.safe_load(config_path.open())
 SSH_KEY = Path(CONFIG["ssh"]["key_path"]).expanduser()
 
 
