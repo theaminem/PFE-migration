@@ -24,39 +24,17 @@ ssh:
 # ─── Répertoire de staging sur les instances distantes ────────────────────────
 staging_dir: "/tmp/migration"
 
-# ─── Services à migrer ────────────────────────────────────────────────────────
-# Ajouter ou retirer un bloc ici suffit pour adapter la migration à une autre infra.
-services:
-  mariadb:
-    lxc_ip:      "10.0.3.10"
-    internal_ip: "10.10.10.10"
-    flavor:      "m1.mariadb"
-    transfer_files:
-      - "app_db.sql"
-      - "sysmonitor.sql"
-  apache:
-    lxc_ip:      "10.0.3.20"
-    internal_ip: "10.10.10.20"
-    flavor:      "m1.apache"
-    transfer_files:
-      - "html.tar.gz"
-      - "apache2.tar.gz"
-  backup:
-    lxc_ip:      "10.0.3.30"
-    internal_ip: "10.10.10.30"
-    flavor:      "m1.backup"
-    transfer_files: []
-  ftp:
-    lxc_ip:      "10.0.3.40"
-    internal_ip: "10.10.10.40"
-    flavor:      "m1.ftp"
-    transfer_files:
-      - "ftp_ftpuser.tar.gz"
-      - "ftp_ftpuser1.tar.gz"
-      - "ftp_ftpuser2.tar.gz"
-  nfs:
-    lxc_ip:      "10.0.3.50"
-    internal_ip: "10.10.10.50"
-    flavor:      "m1.nfs"
-    transfer_files:
-      - "nfs_shared.tar.gz"
+# ─── Flavors OpenStack par nom de container (fallback: default) ───────────────
+# Ajouter un nouveau container dans LXC suffit — le script le détecte
+# automatiquement et lui attribue le flavor correspondant (ou "default").
+flavors:
+  default: "m1.small"
+  mariadb: "m1.mariadb"
+  apache:  "m1.apache"
+  backup:  "m1.backup"
+  ftp:     "m1.ftp"
+  nfs:     "m1.nfs"
+
+# ─── Pool d'IPs internes ──────────────────────────────────────────────────────
+# Première IP du pool. Chaque container reçoit +10 sur le dernier octet.
+internal_ip_pool: "10.10.10.10"
