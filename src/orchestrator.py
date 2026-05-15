@@ -90,8 +90,7 @@ def reinitialiser_haproxy():
             "default_backend cloud_backend",
             "default_backend lxc_backend"
         )
-        with open(haproxy_cfg, "w") as f:
-            f.write(contenu)
+        subprocess.run(["sudo", "tee", haproxy_cfg], input=contenu.encode(), check=True, stdout=subprocess.DEVNULL)
         subprocess.run(["sudo", "systemctl", "reload", "haproxy"], check=True)
         ok("HAProxy remis sur lxc_backend")
     except Exception as e:
@@ -1348,9 +1347,7 @@ def basculer_haproxy(floating_ip_apache: str):
             "default_backend lxc_backend",
             "default_backend cloud_backend"
         )
-        with open(haproxy_cfg, "w") as f:
-            f.write(contenu)
-        import subprocess
+        subprocess.run(["sudo", "tee", haproxy_cfg], input=contenu.encode(), check=True, stdout=subprocess.DEVNULL)
         subprocess.run(["sudo", "systemctl", "reload", "haproxy"], check=True)
         ok("HAProxy bascule vers instance apache OpenStack")
     except Exception as e:
