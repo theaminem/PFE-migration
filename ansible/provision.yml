@@ -54,6 +54,7 @@
           - libapache2-mod-php
           - php-mysql
           - php-curl
+          - nfs-common
         state: present
         lock_timeout: 300
     - name: Demarrage apache2
@@ -90,6 +91,7 @@
       apt:
         name:
           - vsftpd
+          - nfs-common
         state: present
         lock_timeout: 300
     - name: Demarrage vsftpd
@@ -112,13 +114,57 @@
           - mariadb-server
           - mariadb-client
           - python3-pymysql
+          - rsync
         state: present
         lock_timeout: 300
-    - name: Demarrage mariadb
+    - name: Demarrage mariadb initial (initialise /var/lib/mysql)
       service:
         name: mariadb
         state: started
         enabled: true
+    - name: Formatage du volume Cinder (si non formate)
+      filesystem:
+        fstype: ext4
+        dev: /dev/vdb
+    - name: Arret mariadb avant migration sur volume
+      service:
+        name: mariadb
+        state: stopped
+    - name: Creation point de montage temporaire
+      file:
+        path: /mnt/mariadb-data
+        state: directory
+    - name: Montage temporaire du volume
+      mount:
+        src: /dev/vdb
+        path: /mnt/mariadb-data
+        fstype: ext4
+        state: mounted
+    - name: Copie des donnees MariaDB vers le volume
+      command: rsync -a /var/lib/mysql/ /mnt/mariadb-data/
+      args:
+        creates: /mnt/mariadb-data/mysql
+    - name: Demontage temporaire
+      mount:
+        path: /mnt/mariadb-data
+        state: unmounted
+    - name: Montage persistant du volume sur /var/lib/mysql
+      mount:
+        src: /dev/vdb
+        path: /var/lib/mysql
+        fstype: ext4
+        opts: defaults,_netdev
+        state: mounted
+    - name: Correction des permissions sur le volume
+      file:
+        path: /var/lib/mysql
+        owner: mysql
+        group: mysql
+        recurse: yes
+    - name: Demarrage mariadb sur le volume Cinder
+      service:
+        name: mariadb
+        state: started
 
 - name: Provisionnement nfs
   hosts: nfs

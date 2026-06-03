@@ -55,23 +55,33 @@ def executer_cmd(commande: list, cwd=None) -> subprocess.CompletedProcess:
         shell=False,
         cwd=cwd,
         capture_output=True,
-        text=True
+        text=True,
+        env=os.environ.copy()
     )
 
 
-def attendre_ssh(ip: str, timeout: int = 120):
+def attendre_ssh(ip: str, timeout: int = 120, proxy_ip: str = None):
     debut = time.time()
     while time.time() - debut < timeout:
         try:
             client = paramiko.SSHClient()
             client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-            client.connect(
-                hostname=ip,
-                username=CONFIG["ssh"]["user"],
-                key_filename=str(SSH_KEY),
-                timeout=5
-            )
-            client.close()
+            if proxy_ip:
+                proxy = paramiko.SSHClient()
+                proxy.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+                proxy.connect(hostname=proxy_ip, username=CONFIG["ssh"]["user"],
+                              key_filename=str(SSH_KEY), timeout=10)
+                channel = proxy.get_transport().open_channel(
+                    "direct-tcpip", (ip, 22), ("127.0.0.1", 0)
+                )
+                client.connect(hostname=ip, username=CONFIG["ssh"]["user"],
+                               key_filename=str(SSH_KEY), timeout=5, sock=channel)
+                client.close()
+                proxy.close()
+            else:
+                client.connect(hostname=ip, username=CONFIG["ssh"]["user"],
+                               key_filename=str(SSH_KEY), timeout=5)
+                client.close()
             return True
         except Exception:
             time.sleep(5)
@@ -80,21 +90,51 @@ def attendre_ssh(ip: str, timeout: int = 120):
 
 # ─── Prérequis ────────────────────────────────────────────────────────────────
 
-def reinitialiser_haproxy():
-    """Remet HAProxy sur lxc_backend avant la migration."""
-    haproxy_cfg = "/etc/haproxy/haproxy.cfg"
+IPTABLES_CHAIN = "MIGRATION"
+
+
+def _get_lxc_apache_ip() -> str:
+    r = executer_cmd(["sudo", "lxc-ls", "--fancy"])
+    for line in r.stdout.splitlines():
+        if line.startswith("apache") and "RUNNING" in line:
+            parts = line.split()
+            if len(parts) >= 4:
+                return parts[3]
+    return "10.0.3.20"
+
+
+def _preparer_chaine_iptables():
+    r = executer_cmd(["sudo", "iptables", "-t", "nat", "-L", IPTABLES_CHAIN])
+    if r.returncode != 0:
+        executer_cmd(["sudo", "iptables", "-t", "nat", "-N", IPTABLES_CHAIN])
+    r = executer_cmd(["sudo", "iptables", "-t", "nat", "-C", "PREROUTING",
+                      "-p", "tcp", "--dport", "80", "-j", IPTABLES_CHAIN])
+    if r.returncode != 0:
+        executer_cmd(["sudo", "iptables", "-t", "nat", "-I", "PREROUTING", "1",
+                      "-p", "tcp", "--dport", "80", "-j", IPTABLES_CHAIN])
+    r = executer_cmd(["sudo", "iptables", "-t", "nat", "-C", "POSTROUTING", "-j", "MASQUERADE"])
+    if r.returncode != 0:
+        executer_cmd(["sudo", "iptables", "-t", "nat", "-A", "POSTROUTING", "-j", "MASQUERADE"])
+
+
+def configurer_iptables(target_ip: str):
+    """Redirige le port 80 du host vers target_ip via DNAT iptables."""
     try:
-        with open(haproxy_cfg, "r") as f:
-            contenu = f.read()
-        contenu = contenu.replace(
-            "default_backend cloud_backend",
-            "default_backend lxc_backend"
-        )
-        subprocess.run(["sudo", "tee", haproxy_cfg], input=contenu.encode(), check=True, stdout=subprocess.DEVNULL)
-        subprocess.run(["sudo", "systemctl", "reload", "haproxy"], check=True)
-        ok("HAProxy remis sur lxc_backend")
+        executer_cmd(["sudo", "sysctl", "-w", "net.ipv4.ip_forward=1"])
+        executer_cmd(["sudo", "sh", "-c",
+                      "echo 'net.ipv4.ip_forward=1' > /etc/sysctl.d/99-migration.conf"])
+        _preparer_chaine_iptables()
+        executer_cmd(["sudo", "iptables", "-t", "nat", "-F", IPTABLES_CHAIN])
+        r = executer_cmd(["sudo", "iptables", "-t", "nat", "-A", IPTABLES_CHAIN,
+                          "-p", "tcp", "-j", "DNAT", "--to-destination", f"{target_ip}:80"])
+        if r.returncode == 0:
+            executer_cmd(["sudo", "sh", "-c",
+                          "mkdir -p /etc/iptables && iptables-save > /etc/iptables/rules.v4"])
+            ok(f"iptables DNAT port 80 -> {target_ip}")
+        else:
+            fail(f"iptables DNAT -> {target_ip}: {r.stderr.strip()}")
     except Exception as e:
-        fail(f"HAProxy reinitialisation echouee : {e}")
+        fail(f"iptables: {e}")
 
 def verifier_prerequis():
     titre("1", "9", "Verification des prerequis")
@@ -135,17 +175,9 @@ def verifier_prerequis():
 
 def collecter_credentials() -> dict:
     titre("2", "9", "Collecte des credentials")
-    print("  Les credentials ne seront jamais affiches ni logges.\n")
-
-    default_user    = CONFIG["openstack"]["default_user"]
-    default_project = CONFIG["openstack"]["default_project"]
-    os_username = input(f"  Utilisateur OpenStack [{default_user}] : ").strip() or default_user
-    os_project  = input(f"  Projet OpenStack [{default_project}] : ").strip() or default_project
+    print("  Credentials OpenStack lus depuis les variables d'environnement.\n")
 
     return {
-        "os_username":           os_username,
-        "os_project":            os_project,
-        "os_password":           getpass.getpass("  Mot de passe OpenStack : "),
         "mariadb_root_password": getpass.getpass("  Mot de passe MariaDB root : "),
         "mariadb_app_password":  getpass.getpass("  Mot de passe MariaDB appuser : "),
     }
@@ -171,47 +203,28 @@ def phase_scan(state: State) -> list:
 # ─── Phase Terraform ──────────────────────────────────────────────────────────
 
 def generer_tfvars(containers: list, credentials: dict) -> dict:
-    """Build terraform.tfvars from scan results. Returns {container_name: internal_ip}."""
-    cfg_net     = CONFIG["network"]
-    cfg_os      = CONFIG["openstack"]
+    """Build terraform.tfvars from scan results. Returns {container_name: ip}."""
     cfg_flavors = CONFIG.get("flavors", {})
 
     ssh_pub_key = Path(CONFIG["ssh"]["key_path"] + ".pub").expanduser().read_text().strip()
 
-    # Assign sequential IPs from the pool (increment last octet by 10 per container)
-    pool_base = CONFIG["internal_ip_pool"]
-    parts  = pool_base.split(".")
-    prefix = ".".join(parts[:3])
-    start  = int(parts[3])
-
-    ip_mapping = {}
-    for i, c in enumerate(containers):
-        ip_mapping[c.name] = f"{prefix}.{start + i * 10}"
-
     instances_hcl = ""
-    for nom, internal_ip in ip_mapping.items():
-        flavor = cfg_flavors.get(nom, cfg_flavors.get("default", "m1.small"))
-        instances_hcl += f'  {nom} = {{ internal_ip = "{internal_ip}", flavor = "{flavor}" }}\n'
+    for c in containers:
+        flavor = cfg_flavors.get(c.name, cfg_flavors.get("default", "m1.small"))
+        instances_hcl += f'  {c.name} = {{ flavor = "{flavor}" }}\n'
 
-    tfvars = f"""os_auth_url     = "{cfg_os['auth_url']}"
-os_username     = "{credentials['os_username']}"
-os_password     = "{credentials['os_password']}"
-os_project_name = "{credentials['os_project']}"
-os_region       = "{cfg_os['region']}"
-
-provider_network       = "{cfg_net['provider']}"
-migration_network_cidr = "{cfg_net['internal_cidr']}"
-migration_gateway      = "{cfg_net['internal_gateway']}"
-
-image_name     = "{CONFIG['image']['name']}"
-ssh_public_key = "{ssh_pub_key}"
+    tfvars = f"""image_name          = "{CONFIG['image']['name']}"
+ssh_public_key      = "{ssh_pub_key}"
+external_network_id = "{CONFIG['network']['external_network_id']}"
+apache_floating_ip  = "{CONFIG['network']['apache_floating_ip']}"
+private_subnet_cidr = "{CONFIG['network'].get('private_subnet_cidr', '10.10.0.0/24')}"
 
 instances = {{
 {instances_hcl}}}
 """
 
     (TERRAFORM_DIR / "terraform.tfvars").write_text(tfvars)
-    return ip_mapping
+    return {}
 
 
 def phase_provisioning(state: State, credentials: dict, containers: list):
@@ -240,17 +253,18 @@ def phase_provisioning(state: State, credentials: dict, containers: list):
     outputs = json.loads(r.stdout)
     instances = outputs["instances"]["value"]
 
-    # Derive lxc_ip from the scan, not from a static config
     container_map = {c.name: c for c in containers}
     for nom, data in instances.items():
         c = container_map.get(nom)
         state.enregistrer_ip(
             nom,
             lxc_ip=c.ip if c else "",
-            internal_ip=data["internal_ip"],
+            internal_ip=data["ip"],
             floating_ip=data["floating_ip"]
         )
-        info(f"  {nom:.<20} {data['internal_ip']} -> {data['floating_ip']}")
+        fip = data["floating_ip"]
+        display = f"{data['ip']} (FIP: {fip})" if fip != data["ip"] else data["ip"]
+        info(f"  {nom:.<20} {display}")
 
     # Supprime terraform.tfvars (contient le mot de passe)
     tfvars_path = TERRAFORM_DIR / "terraform.tfvars"
@@ -258,12 +272,23 @@ def phase_provisioning(state: State, credentials: dict, containers: list):
         tfvars_path.unlink()
         info("  terraform.tfvars supprime (securite)")
 
-    # Attente SSH sur toutes les instances
+    apache_fip        = CONFIG["network"].get("apache_floating_ip", "")
+    apache_connect_ip = apache_fip if apache_fip else instances.get("apache", {}).get("ip", "")
+
     info("")
-    info("Attente SSH sur les instances...")
+    info("Attente SSH sur Apache (porte d'entree)...")
+    if not attendre_ssh(apache_connect_ip, timeout=300):
+        fail(f"SSH apache ({apache_connect_ip})")
+        raise Exception(f"SSH timeout sur apache ({apache_connect_ip})")
+    ok(f"SSH apache ({apache_connect_ip})")
+
+    info("Attente SSH sur les autres instances (via ProxyJump)...")
     for nom, data in instances.items():
-        ip = data["floating_ip"]
-        if attendre_ssh(ip):
+        if nom == "apache":
+            continue
+        ip    = data["ip"]
+        proxy = apache_connect_ip if apache_fip else None
+        if attendre_ssh(ip, proxy_ip=proxy):
             ok(f"SSH {nom} ({ip})")
         else:
             fail(f"SSH {nom} ({ip})")
@@ -289,10 +314,9 @@ def generer_group_vars(instances: dict):
     content += f"ansible_ssh_private_key_file: {cfg['ssh']['key_path']}\n"
     content += "ansible_ssh_common_args: '-o StrictHostKeyChecking=no'\n"
     content += f"staging_dir: \"{cfg['staging_dir']}\"\n"
-    content += f"internal_subnet: \"{cfg['network']['internal_cidr']}\"\n"
     content += "new_ips:\n"
     for nom, data in instances.items():
-        content += f"  {nom}: \"{data['internal_ip']}\"\n"
+        content += f"  {nom}: \"{data['ip']}\"\n"
     gv_path = ANSIBLE_DIR / "group_vars" / "all.yml"
     gv_path.parent.mkdir(parents=True, exist_ok=True)
     gv_path.write_text(content)
@@ -411,6 +435,53 @@ def generer_provision_yml(containers: list):
                 "        enabled: true",
             ]
 
+        if "mariadb" in c.services:
+            lines += [
+                "    - name: Formatage du volume Cinder (si non formate)",
+                "      filesystem:",
+                "        fstype: ext4",
+                "        dev: /dev/vdb",
+                "    - name: Arret mariadb avant migration sur volume",
+                "      service:",
+                "        name: mariadb",
+                "        state: stopped",
+                "    - name: Creation point de montage temporaire",
+                "      file:",
+                "        path: /mnt/mariadb-data",
+                "        state: directory",
+                "    - name: Montage temporaire du volume",
+                "      mount:",
+                "        src: /dev/vdb",
+                "        path: /mnt/mariadb-data",
+                "        fstype: ext4",
+                "        state: mounted",
+                "    - name: Copie des donnees MariaDB vers le volume",
+                "      command: rsync -a /var/lib/mysql/ /mnt/mariadb-data/",
+                "      args:",
+                "        creates: /mnt/mariadb-data/mysql",
+                "    - name: Demontage temporaire",
+                "      mount:",
+                "        path: /mnt/mariadb-data",
+                "        state: unmounted",
+                "    - name: Montage persistant du volume sur /var/lib/mysql",
+                "      mount:",
+                "        src: /dev/vdb",
+                "        path: /var/lib/mysql",
+                "        fstype: ext4",
+                "        opts: defaults,_netdev",
+                "        state: mounted",
+                "    - name: Correction des permissions sur le volume",
+                "      file:",
+                "        path: /var/lib/mysql",
+                "        owner: mysql",
+                "        group: mysql",
+                "        recurse: yes",
+                "    - name: Demarrage mariadb sur le volume Cinder",
+                "      service:",
+                "        name: mariadb",
+                "        state: started",
+            ]
+
     (ANSIBLE_DIR / "provision.yml").write_text("\n".join(lines) + "\n")
     ok("provision.yml")
 
@@ -478,7 +549,7 @@ def _restore_mariadb_play(c, apache_containers, backup_containers):
         "      lineinfile:",
         "        path: /etc/mysql/mariadb.conf.d/50-server.cnf",
         "        regexp: '^bind-address'",
-        "        line: 'bind-address = {{ internal_ip }}'",
+        "        line: 'bind-address = {{ instance_ip }}'",
         "",
         "    - name: Redemarrage MariaDB",
         "      service:",
@@ -520,7 +591,7 @@ def _restore_apache_play(c, containers, nfs_containers):
         "",
         "    - name: Montage persistant du code web depuis NFS",
         "      mount:",
-        f"        src: {nfs_ip}:/srv/nfs/shared/html",
+        f'        src: "{nfs_ip}:/srv/nfs/shared/html"',
         "        path: /var/www/html",
         "        fstype: nfs",
         "        opts: defaults,_netdev",
@@ -604,8 +675,8 @@ def _restore_nfs_play(c):
         "    - name: Reecriture /etc/exports avec nouveau sous-reseau",
         "      copy:",
         "        content: |",
-        "          /srv/nfs/shared {{ internal_subnet }}(rw,sync,no_subtree_check,root_squash)",
-        "          /srv/nfs/shared/ftp_uploads {{ internal_subnet }}(rw,sync,no_subtree_check,root_squash)",
+        f"          /srv/nfs/shared {CONFIG['network'].get('private_subnet_cidr', '10.10.0.0/24')}(rw,sync,no_subtree_check,no_root_squash)",
+        f"          /srv/nfs/shared/ftp_uploads {CONFIG['network'].get('private_subnet_cidr', '10.10.0.0/24')}(rw,sync,no_subtree_check,no_root_squash)",
         "        dest: /etc/exports",
         "",
         "    - name: Activation des exports NFS",
@@ -706,7 +777,7 @@ def _restore_ftp_play(c, nfs_containers):
         "",
         "    - name: Montage persistant du partage FTP depuis NFS",
         "      mount:",
-        f"        src: {nfs_ip}:/srv/nfs/shared/ftp_uploads",
+        f'        src: "{nfs_ip}:/srv/nfs/shared/ftp_uploads"',
         '        path: "{{ item.home }}/files"',
         "        fstype: nfs",
         "        opts: defaults,_netdev",
@@ -1023,6 +1094,21 @@ def _validate_ftp_play(c):
         "      register: ftp_mounts",
         "      changed_when: false",
         "",
+        "    - name: Verification password hash non vide pour chaque user FTP",
+        "      shell: \"grep '^{{ item.username }}:' /etc/shadow | cut -d: -f2 | grep -qE '^\\$'\"",
+        '      loop: "{{ ftp_users }}"',
+        "      changed_when: false",
+        "      failed_when: false",
+        "      register: ftp_hash_check",
+        "",
+        "    - name: Tous les users FTP ont un hash valide",
+        "      assert:",
+        "        that: item.rc == 0",
+        "        fail_msg: \"User FTP {{ ftp_users[ansible_loop.index0].username }} n'a pas de mot de passe\"",
+        '      loop: "{{ ftp_hash_check.results }}"',
+        "      loop_control:",
+        "        extended: yes",
+        "",
         "    - name: Creation repertoire rapport",
         "      file:",
         "        path: /tmp/migration",
@@ -1061,12 +1147,35 @@ def generer_validate_yml(containers: list, ip_mapping: dict):
 def generer_inventaire(instances: dict, containers: list):
     titre("5", "9", "Generation inventaire Ansible")
 
-    ssh_user = CONFIG["ssh"]["user"]
-    inventory = ""
+    apache_fip = CONFIG["network"].get("apache_floating_ip", "")
+    ssh_user   = CONFIG["ssh"]["user"]
+
+    if apache_fip:
+        subprocess.run(
+            ["ssh-keygen", "-R", apache_fip],
+            capture_output=True
+        )
+        apache_internal = instances.get("apache", {}).get("ip", "")
+        if apache_internal:
+            subprocess.run(
+                ["ssh-keygen", "-R", apache_internal],
+                capture_output=True
+            )
+    inventory  = ""
     for nom, data in instances.items():
+        if nom == "apache" and apache_fip:
+            host_ip = apache_fip
+            extra   = ""
+        else:
+            host_ip     = data["ip"]
+            proxy_args  = (
+                f'-o StrictHostKeyChecking=no '
+                f'-o ProxyCommand="ssh -i {SSH_KEY} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -W %h:%p {ssh_user}@{apache_fip}"'
+            )
+            extra       = f" ansible_ssh_common_args='{proxy_args}'"
         inventory += f"[{nom}]\n"
-        inventory += f"{data['floating_ip']} ansible_user={ssh_user} "
-        inventory += f"ansible_ssh_private_key_file={SSH_KEY}\n\n"
+        inventory += f"{host_ip} ansible_user={ssh_user} "
+        inventory += f"ansible_ssh_private_key_file={SSH_KEY}{extra}\n\n"
 
     inv_path = ANSIBLE_DIR / "inventory.ini"
     inv_path.write_text(inventory)
@@ -1084,8 +1193,7 @@ def generer_inventaire(instances: dict, containers: list):
 
         host_vars = {
             "old_lxc_ip":    c.ip,
-            "internal_ip":   data["internal_ip"],
-            "floating_ip":   data["floating_ip"],
+            "instance_ip":   data["ip"],
         }
 
         if c.databases:
@@ -1096,7 +1204,7 @@ def generer_inventaire(instances: dict, containers: list):
             )
         if c.ftp_users:
             host_vars["ftp_users"] = [
-                {"username": u.username, "home": u.home, "password_hash": ""}
+                {"username": u.username, "home": u.home, "password_hash": u.password_hash}
                 for u in c.ftp_users
             ]
         if c.vsftpd_config:
@@ -1107,14 +1215,15 @@ def generer_inventaire(instances: dict, containers: list):
                 for e in c.nfs_exports
             ]
 
-        hv_path = hv_dir / f"{data['floating_ip']}.yml"
+        hv_ip   = data["floating_ip"] if nom == "apache" and apache_fip else data["ip"]
+        hv_path = hv_dir / f"{hv_ip}.yml"
         hv_path.write_text(
             "---\n" + "\n".join(f"{k}: {json.dumps(v)}" for k, v in host_vars.items())
         )
         ok(f"host_vars {nom}")
 
     # Generate all three playbooks from the live scan
-    ip_mapping = {nom: data["internal_ip"] for nom, data in instances.items()}
+    ip_mapping = {nom: data["ip"] for nom, data in instances.items()}
     generer_provision_yml(containers)
     generer_restore_yml(containers, ip_mapping)
     generer_validate_yml(containers, ip_mapping)
@@ -1211,14 +1320,13 @@ def phase_backup(containers: list, credentials: dict):
 def phase_transfert(instances: dict, tmp_dir: str, containers: list, state: State):
     titre("7", "9", "Transfert des archives")
 
+    apache_fip    = CONFIG["network"].get("apache_floating_ip", "")
     container_map = {c.name: c for c in containers}
 
     for nom, data in instances.items():
         c = container_map.get(nom)
         if not c:
             continue
-
-        floating_ip = data["floating_ip"]
 
         # Build file list dynamically from scan — no static config needed
         fichiers = []
@@ -1234,22 +1342,54 @@ def phase_transfert(instances: dict, tmp_dir: str, containers: list, state: Stat
         if not fichiers:
             continue
 
-        info(f"Transfert vers {nom} ({floating_ip})...")
+        connect_ip = data["floating_ip"] if nom == "apache" else data["ip"]
+        use_proxy  = bool(apache_fip) and nom != "apache"
 
+        info(f"Transfert vers {nom} ({connect_ip})...")
+
+        proxy_client = None
         client = paramiko.SSHClient()
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 
         for tentative in range(5):
             try:
-                client.connect(
-                    hostname=floating_ip,
-                    username=CONFIG["ssh"]["user"],
-                    key_filename=str(SSH_KEY),
-                    timeout=30,
-                    banner_timeout=60
-                )
+                if use_proxy:
+                    proxy_client = paramiko.SSHClient()
+                    proxy_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+                    proxy_client.connect(
+                        hostname=apache_fip,
+                        username=CONFIG["ssh"]["user"],
+                        key_filename=str(SSH_KEY),
+                        timeout=30,
+                        banner_timeout=60
+                    )
+                    channel = proxy_client.get_transport().open_channel(
+                        "direct-tcpip", (connect_ip, 22), ("127.0.0.1", 0)
+                    )
+                    client.connect(
+                        hostname=connect_ip,
+                        username=CONFIG["ssh"]["user"],
+                        key_filename=str(SSH_KEY),
+                        timeout=30,
+                        banner_timeout=60,
+                        sock=channel
+                    )
+                else:
+                    client.connect(
+                        hostname=connect_ip,
+                        username=CONFIG["ssh"]["user"],
+                        key_filename=str(SSH_KEY),
+                        timeout=30,
+                        banner_timeout=60
+                    )
                 break
             except Exception as e:
+                if proxy_client:
+                    try:
+                        proxy_client.close()
+                    except Exception:
+                        pass
+                    proxy_client = None
                 if tentative < 4:
                     time.sleep(10)
                 else:
@@ -1258,7 +1398,7 @@ def phase_transfert(instances: dict, tmp_dir: str, containers: list, state: Stat
         staging = CONFIG["staging_dir"]
         _, _, stderr = client.exec_command(f"mkdir -p {staging}")
         if stderr.read():
-            raise Exception(f"mkdir {staging} echoue sur {floating_ip}")
+            raise Exception(f"mkdir {staging} echoue sur {connect_ip}")
         sftp = client.open_sftp()
 
         for fichier in fichiers:
@@ -1271,6 +1411,8 @@ def phase_transfert(instances: dict, tmp_dir: str, containers: list, state: Stat
 
         sftp.close()
         client.close()
+        if proxy_client:
+            proxy_client.close()
 
     shutil.rmtree(tmp_dir)
     info("Repertoire temporaire supprime")
@@ -1303,6 +1445,11 @@ def phase_ansible(state: State, phase: Phase, etape_num: str,
     titre(etape_num, "9", etape_nom)
     inventaire = str(ANSIBLE_DIR / "inventory.ini")
 
+    cp_dir = Path.home() / ".ansible" / "cp"
+    if cp_dir.exists():
+        for sock in cp_dir.iterdir():
+            sock.unlink(missing_ok=True)
+
     info(f"ansible-playbook {playbook}...")
     lancer_ansible(str(ANSIBLE_DIR / playbook), inventaire, extra_vars)
     ok(etape_nom)
@@ -1315,43 +1462,36 @@ def rollback(state: State, erreur: str):
     print(f"\n  ERREUR : {erreur}")
     print("  Rollback en cours...")
 
+    # Détruire uniquement les instances et volumes — pas le réseau.
+    # Le réseau (router/subnet) est lent à recréer sur CERIST, on le conserve
+    # entre les runs pour éviter le timeout sur router_interface.
+    cibles = [
+        "openstack_compute_floatingip_associate_v2.apache_fip",
+        "openstack_compute_volume_attach_v2.mariadb_volume_attach",
+        'openstack_compute_instance_v2.instances["apache"]',
+        'openstack_compute_instance_v2.instances["backup"]',
+        'openstack_compute_instance_v2.instances["ftp"]',
+        'openstack_compute_instance_v2.instances["mariadb"]',
+        'openstack_compute_instance_v2.instances["nfs"]',
+    ]
+    target_args = []
+    for t in cibles:
+        target_args += ["-target", t]
+
     r = executer_cmd(
-        ["terraform", "destroy", "-auto-approve", "-no-color"],
+        ["terraform", "destroy", "-auto-approve", "-no-color"] + target_args,
         cwd=TERRAFORM_DIR
     )
     if r.returncode == 0:
-        ok("Ressources OpenStack supprimees")
+        ok("Instances OpenStack supprimees")
     else:
-        fail("terraform destroy")
+        fail("terraform destroy (instances)")
 
     state.marquer_echec(erreur)
 
 
 # ─── Rapport final ────────────────────────────────────────────────────────────
 
-def basculer_haproxy(floating_ip_apache: str):
-    """Bascule HAProxy vers l instance OpenStack apache apres migration."""
-    haproxy_cfg = "/etc/haproxy/haproxy.cfg"
-    try:
-        with open(haproxy_cfg, "r") as f:
-            contenu = f.read()
-        # Mettre a jour l IP du backend cloud
-        import re
-        contenu = re.sub(
-            r"server apache_cloud \S+",
-            f"server apache_cloud {floating_ip_apache}:80 check",
-            contenu
-        )
-        # Basculer vers cloud_backend
-        contenu = contenu.replace(
-            "default_backend lxc_backend",
-            "default_backend cloud_backend"
-        )
-        subprocess.run(["sudo", "tee", haproxy_cfg], input=contenu.encode(), check=True, stdout=subprocess.DEVNULL)
-        subprocess.run(["sudo", "systemctl", "reload", "haproxy"], check=True)
-        ok("HAProxy bascule vers instance apache OpenStack")
-    except Exception as e:
-        fail(f"HAProxy bascule echouee : {e}")
 
 
 def generer_rapport(state: State, instances: dict):
@@ -1364,25 +1504,25 @@ def generer_rapport(state: State, instances: dict):
         "instances": {},
     }
 
-    print(f"\n  {'Service':<12} {'Ancienne IP':<16} {'IP interne':<16} {'Floating IP':<16}")
-    print(f"  {'-'*12} {'-'*16} {'-'*16} {'-'*16}")
+    print(f"\n  {'Service':<12} {'Ancienne IP':<16} {'IP instance':<16}")
+    print(f"  {'-'*12} {'-'*16} {'-'*16}")
 
     for nom, data in instances.items():
         lxc_ip = state.ip_mapping.get(nom, {}).get("lxc_ip", "")
         rapport["instances"][nom] = {
-            "old_lxc_ip":   lxc_ip,
-            "internal_ip":  data["internal_ip"],
-            "floating_ip":  data["floating_ip"],
-            "validation":   "passed" if Phase.VALIDATE in [Phase[p] for p in state.phases_ok] else "skipped"
+            "old_lxc_ip":  lxc_ip,
+            "ip":          data["ip"],
+            "validation":  "passed" if Phase.VALIDATE in [Phase[p] for p in state.phases_ok] else "skipped"
         }
-        print(f"  {nom:<12} {lxc_ip:<16} {data['internal_ip']:<16} {data['floating_ip']:<16}")
+        print(f"  {nom:<12} {lxc_ip:<16} {data['ip']:<16}")
 
     rapport_path = BASE_DIR / "migration_report.json"
     rapport_path.write_text(json.dumps(rapport, indent=2))
     print(f"\n  Rapport ecrit : {rapport_path}")
-    apache_floating_ip = instances.get("apache", {}).get("floating_ip", "")
-    if apache_floating_ip:
-        basculer_haproxy(apache_floating_ip)
+    apache_data = instances.get("apache", {})
+    apache_ip   = apache_data.get("floating_ip") or apache_data.get("ip", "")
+    if apache_ip:
+        configurer_iptables(apache_ip)
     print("\n=== Migration terminee avec succes ===\n")
 
 
@@ -1397,7 +1537,7 @@ def main():
 
     try:
         verifier_prerequis()
-        reinitialiser_haproxy()
+        configurer_iptables(_get_lxc_apache_ip())
         credentials = collecter_credentials()
 
         if state.phase.value <= Phase.SCAN.value:
@@ -1410,7 +1550,14 @@ def main():
             generer_inventaire(instances, containers)
         else:
             r = executer_cmd(["terraform", "output", "-json"], cwd=TERRAFORM_DIR)
-            instances = json.loads(r.stdout)["instances"]["value"]
+            outputs = json.loads(r.stdout) if r.returncode == 0 and r.stdout.strip() else {}
+            if "instances" in outputs:
+                instances = outputs["instances"]["value"]
+            else:
+                instances = {
+                    nom: {"ip": data["internal_ip"], "floating_ip": data.get("floating_ip", data["internal_ip"])}
+                    for nom, data in state.ip_mapping.items()
+                }
 
         if state.phase.value <= Phase.BACKUP.value:
             tmp_dir = phase_backup(containers, credentials)
@@ -1436,5 +1583,30 @@ def main():
         sys.exit(1)
 
 
+def regenerer_inventaire():
+    """Relit le terraform output et regénère l'inventaire Ansible."""
+    r = executer_cmd(["terraform", "output", "-json"], cwd=TERRAFORM_DIR)
+    if r.returncode != 0:
+        print("Erreur : terraform output a échoué")
+        sys.exit(1)
+    outputs = json.loads(r.stdout)
+    if "instances" not in outputs:
+        print("  Pas de state Terraform. Régénération des playbooks uniquement.")
+        containers = scanner_containers()
+        generer_provision_yml(containers)
+        ip_mapping = {}
+        generer_restore_yml(containers, ip_mapping)
+        generer_validate_yml(containers, ip_mapping)
+        print("Playbooks régénérés.")
+        return
+    instances = outputs["instances"]["value"]
+    containers = scanner_containers()
+    generer_inventaire(instances, containers)
+    print("Inventaire régénéré.")
+
+
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) > 1 and sys.argv[1] == "--regen-inventory":
+        regenerer_inventaire()
+    else:
+        main()

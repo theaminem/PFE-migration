@@ -20,6 +20,11 @@
         status_code: 200
       register: http_check
 
+    - name: Verification montage NFS du code web
+      shell: mount | grep ' /var/www/html ' | grep nfs
+      register: apache_mount
+      changed_when: false
+
     - name: Verification absence anciennes IPs LXC
       shell: grep -rE "10\.0\." /var/www/html/config.php || echo "OK"
       register: ip_check
@@ -59,6 +64,24 @@
         that: ip_in_backup.rc == 0
         fail_msg: "La nouvelle IP mariadb est absente de backup.sh"
 
+    - name: Verification options mysqldump sans lock
+      shell: grep -- '--single-transaction --skip-lock-tables' /usr/local/bin/backup.sh
+      register: backup_opts
+
+    - name: Options mysqldump presentes
+      assert:
+        that: backup_opts.rc == 0
+        fail_msg: "Le script backup.sh n'utilise pas les options mysqldump attendues"
+
+    - name: Verification base app_db dans backup.sh
+      shell: grep 'DB="app_db"' /usr/local/bin/backup.sh
+      register: backup_db
+
+    - name: Base cible correcte dans backup.sh
+      assert:
+        that: backup_db.rc == 0
+        fail_msg: "La base cible attendue est absente de backup.sh"
+
     - name: Verification cron actif
       service_facts:
 
@@ -90,11 +113,17 @@
         that: ansible_facts.services['vsftpd.service'].state == 'running'
         fail_msg: "vsftpd n'est pas actif"
 
-    - name: Verification repertoires users FTP
+    - name: Verification repertoires files des users FTP
       stat:
-        path: "{{ item.home }}/uploads"
+        path: "{{ item.home }}/files"
       loop: "{{ ftp_users }}"
       register: ftp_dirs
+
+    - name: Verification montage NFS sur files
+      shell: mount | grep ' {{ item.home }}/files ' | grep nfs
+      loop: "{{ ftp_users }}"
+      register: ftp_mounts
+      changed_when: false
 
     - name: Creation repertoire rapport
       file:
@@ -162,6 +191,26 @@
         paths: /srv/nfs/shared
         recurse: yes
       register: nfs_files
+
+    - name: Verification presence du code web partage
+      stat:
+        path: /srv/nfs/shared/html/index.php
+      register: nfs_web
+
+    - name: Code web partage present
+      assert:
+        that: nfs_web.stat.exists
+        fail_msg: "Le code web partage est absent sur NFS"
+
+    - name: Verification presence du partage FTP
+      stat:
+        path: /srv/nfs/shared/ftp_uploads
+      register: nfs_ftp
+
+    - name: Partage FTP present sur NFS
+      assert:
+        that: nfs_ftp.stat.exists
+        fail_msg: "Le partage FTP est absent sur NFS"
 
     - name: Creation repertoire rapport
       file:

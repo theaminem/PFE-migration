@@ -9,15 +9,9 @@ terraform {
   }
 }
 
-provider "openstack" {
-  auth_url    = var.os_auth_url
-  user_name   = var.os_username
-  password    = var.os_password
-  tenant_name = var.os_project_name
-  region      = var.os_region
-}
+provider "openstack" {}
 
-# ─── Réseau interne ───────────────────────────────────────────────────────────
+# ─── Réseau privé interne ─────────────────────────────────────────────────────
 
 resource "openstack_networking_network_v2" "migration_net" {
   name           = "migration-net"
@@ -27,34 +21,27 @@ resource "openstack_networking_network_v2" "migration_net" {
 resource "openstack_networking_subnet_v2" "migration_subnet" {
   name            = "migration-subnet"
   network_id      = openstack_networking_network_v2.migration_net.id
-  cidr            = var.migration_network_cidr
-  gateway_ip      = var.migration_gateway
+  cidr            = var.private_subnet_cidr
   ip_version      = 4
-  dns_nameservers = ["8.8.8.8"]
-
-  allocation_pools {
-    start = "10.10.10.110"
-    end   = "10.10.10.200"
-  }
+  dns_nameservers = ["8.8.8.8", "8.8.4.4"]
 }
 
-# ─── Router ───────────────────────────────────────────────────────────────────
+# ─── Router vers le réseau public ─────────────────────────────────────────────
 
 resource "openstack_networking_router_v2" "migration_router" {
   name                = "migration-router"
   admin_state_up      = true
-  external_network_id = data.openstack_networking_network_v2.provider.id
+  external_network_id = var.external_network_id
 }
 
-resource "openstack_networking_router_interface_v2" "migration_router_iface" {
+resource "openstack_networking_router_interface_v2" "migration_iface" {
   router_id = openstack_networking_router_v2.migration_router.id
   subnet_id = openstack_networking_subnet_v2.migration_subnet.id
-}
 
-# ─── Réseau provider (référence) ─────────────────────────────────────────────
-
-data "openstack_networking_network_v2" "provider" {
-  name = var.provider_network
+  timeouts {
+    create = "20m"
+    delete = "20m"
+  }
 }
 
 # ─── Clé SSH ──────────────────────────────────────────────────────────────────
@@ -64,11 +51,17 @@ resource "openstack_compute_keypair_v2" "migration_key" {
   public_key = var.ssh_public_key
 }
 
+resource "openstack_blockstorage_volume_v3" "mariadb_volume" {
+  name        = "mariadb-data"
+  size        = 10
+  description = "Volume de données MariaDB"
+}
+
 # ─── Security Groups ──────────────────────────────────────────────────────────
 
 resource "openstack_networking_secgroup_v2" "sg_mariadb" {
   name        = "sg-mariadb"
-  description = "MariaDB : SSH + 3306 depuis réseau interne"
+  description = "MariaDB : SSH + 3306"
 }
 
 resource "openstack_networking_secgroup_rule_v2" "sg_mariadb_ssh" {
@@ -88,7 +81,7 @@ resource "openstack_networking_secgroup_rule_v2" "sg_mariadb_3306" {
   protocol          = "tcp"
   port_range_min    = 3306
   port_range_max    = 3306
-  remote_ip_prefix  = var.migration_network_cidr
+  remote_ip_prefix  = "0.0.0.0/0"
 }
 
 resource "openstack_networking_secgroup_v2" "sg_apache" {
@@ -198,7 +191,7 @@ resource "openstack_networking_secgroup_rule_v2" "sg_nfs_2049" {
   protocol          = "tcp"
   port_range_min    = 2049
   port_range_max    = 2049
-  remote_ip_prefix  = var.migration_network_cidr
+  remote_ip_prefix  = "0.0.0.0/0"
 }
 
 resource "openstack_networking_secgroup_rule_v2" "sg_nfs_111" {
@@ -208,7 +201,7 @@ resource "openstack_networking_secgroup_rule_v2" "sg_nfs_111" {
   protocol          = "tcp"
   port_range_min    = 111
   port_range_max    = 111
-  remote_ip_prefix  = var.migration_network_cidr
+  remote_ip_prefix  = "0.0.0.0/0"
 }
 
 # ─── Mapping container → security group ──────────────────────────────────────
@@ -223,21 +216,6 @@ locals {
   }
 }
 
-# ─── Ports réseau avec IPs fixes ─────────────────────────────────────────────
-
-resource "openstack_networking_port_v2" "ports" {
-  for_each           = var.instances
-  name               = "port-${each.key}"
-  network_id         = openstack_networking_network_v2.migration_net.id
-  admin_state_up     = true
-  security_group_ids = [local.secgroup_map[each.key]]
-
-  fixed_ip {
-    subnet_id  = openstack_networking_subnet_v2.migration_subnet.id
-    ip_address = each.value.internal_ip
-  }
-}
-
 # ─── Instances Nova ───────────────────────────────────────────────────────────
 
 resource "openstack_compute_instance_v2" "instances" {
@@ -246,21 +224,33 @@ resource "openstack_compute_instance_v2" "instances" {
   image_name      = var.image_name
   flavor_name     = each.value.flavor
   key_pair        = openstack_compute_keypair_v2.migration_key.name
+  security_groups = [local.secgroup_map[each.key]]
 
   network {
-    port = openstack_networking_port_v2.ports[each.key].id
+    uuid = openstack_networking_network_v2.migration_net.id
+  }
+
+  depends_on = [openstack_networking_router_interface_v2.migration_iface]
+
+  timeouts {
+    create = "10m"
+    delete = "10m"
   }
 }
 
-# ─── Floating IPs ─────────────────────────────────────────────────────────────
+resource "openstack_compute_volume_attach_v2" "mariadb_volume_attach" {
+  instance_id = openstack_compute_instance_v2.instances["mariadb"].id
+  volume_id   = openstack_blockstorage_volume_v3.mariadb_volume.id
 
-resource "openstack_networking_floatingip_v2" "floating_ips" {
-  for_each = var.instances
-  pool     = var.provider_network
+  timeouts {
+    create = "5m"
+    delete = "5m"
+  }
 }
 
-resource "openstack_networking_floatingip_associate_v2" "fip_assoc" {
-  for_each    = var.instances
-  floating_ip = openstack_networking_floatingip_v2.floating_ips[each.key].address
-  port_id     = openstack_networking_port_v2.ports[each.key].id
+# ─── Floating IP pour Apache (porte d'entrée SSH) ─────────────────────────────
+
+resource "openstack_compute_floatingip_associate_v2" "apache_fip" {
+  floating_ip = var.apache_floating_ip
+  instance_id = openstack_compute_instance_v2.instances["apache"].id
 }

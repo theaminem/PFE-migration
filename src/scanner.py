@@ -25,6 +25,7 @@ class DBUser(BaseModel):
 class FTPUser(BaseModel):
     username: str
     home: str
+    password_hash: str = ""
 
 
 class NFSExport(BaseModel):
@@ -177,6 +178,17 @@ def lire_users_ftp(nom: str) -> List[FTPUser]:
         "pollinate", "landscape", "fwupd-refresh",
         "ubuntu"
     }
+
+    shadow_hashes = {}
+    shadow_sortie = executer([
+        "sudo", "lxc-attach", "-n", nom, "--",
+        "cat", "/etc/shadow"
+    ])
+    for ligne in shadow_sortie.splitlines():
+        parties = ligne.split(":")
+        if len(parties) >= 2 and parties[1].startswith("$"):
+            shadow_hashes[parties[0]] = parties[1]
+
     users = []
     for ligne in sortie.splitlines():
         parties = ligne.split(":")
@@ -189,7 +201,11 @@ def lire_users_ftp(nom: str) -> List[FTPUser]:
             continue
         if shell in exclus_shells:
             continue
-        users.append(FTPUser(username=username, home=home))
+        users.append(FTPUser(
+            username=username,
+            home=home,
+            password_hash=shadow_hashes.get(username, "")
+        ))
     return users
 
 

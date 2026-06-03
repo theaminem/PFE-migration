@@ -1,12 +1,16 @@
 # ─── Outputs par instance ─────────────────────────────────────────────────────
 
 output "instances" {
-  description = "IPs internes et floating IPs de chaque instance"
+  description = "IP privée et floating IP de chaque instance"
   value = {
-    for nom, instance in openstack_compute_instance_v2.instances : nom => {
-      internal_ip = var.instances[nom].internal_ip
-      floating_ip = openstack_networking_floatingip_v2.floating_ips[nom].address
-      instance_id = instance.id
+    for k, v in openstack_compute_instance_v2.instances :
+    k => {
+      ip          = v.access_ip_v4
+      floating_ip = k == "apache" ? openstack_compute_floatingip_associate_v2.apache_fip.floating_ip : v.access_ip_v4
     }
   }
+}
+
+output "mariadb_volume_device" {
+  value = openstack_compute_volume_attach_v2.mariadb_volume_attach.device
 }
