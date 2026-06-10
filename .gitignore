@@ -27,8 +27,14 @@ src/__pycache__/
 
 # Logs
 *.log
+ip_lxc_apache
 
 # Tmp
 /tmp/tmp*
+OpenStack
+
+# Config secrets
 config.yml
-config.yml
+
+# Claude Code local settings
+.claude/

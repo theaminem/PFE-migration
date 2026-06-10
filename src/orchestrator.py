@@ -49,15 +49,38 @@ def info(texte: str):
 
 # ─── Utilitaires ──────────────────────────────────────────────────────────────
 
-def executer_cmd(commande: list, cwd=None) -> subprocess.CompletedProcess:
+def executer_cmd(commande: list, cwd=None, env=None) -> subprocess.CompletedProcess:
     return subprocess.run(
         commande,
         shell=False,
         cwd=cwd,
         capture_output=True,
         text=True,
-        env=os.environ.copy()
+        env=env if env is not None else os.environ.copy()
     )
+
+
+def _terraform_env() -> dict:
+    os_cfg = CONFIG.get("openstack", {})
+    env = os.environ.copy()
+    env.update({
+        "TF_VAR_os_auth_url":          (os.environ.get("OS_AUTH_URL")
+                                        or os_cfg.get("auth_url", "")),
+        "TF_VAR_os_username":          (os.environ.get("OS_USERNAME")
+                                        or os_cfg.get("default_user", "")),
+        "TF_VAR_os_password":          os.environ.get("OS_PASSWORD", ""),
+        "TF_VAR_os_project_name":      (os.environ.get("OS_PROJECT_NAME")
+                                        or os_cfg.get("default_project", "")),
+        "TF_VAR_os_project_id":        (os.environ.get("OS_PROJECT_ID")
+                                        or os_cfg.get("project_id", "")),
+        "TF_VAR_os_user_domain_name":  (os.environ.get("OS_USER_DOMAIN_NAME")
+                                        or os_cfg.get("user_domain_name", "Default")),
+        "TF_VAR_os_project_domain_id": (os.environ.get("OS_PROJECT_DOMAIN_ID")
+                                        or os_cfg.get("project_domain_id", "default")),
+        "TF_VAR_os_region":            (os.environ.get("OS_REGION_NAME")
+                                        or os_cfg.get("region", "RegionOne")),
+    })
+    return env
 
 
 def attendre_ssh(ip: str, timeout: int = 120, proxy_ip: str = None):
@@ -98,7 +121,7 @@ def _get_lxc_apache_ip() -> str:
     for line in r.stdout.splitlines():
         if line.startswith("apache") and "RUNNING" in line:
             parts = line.split()
-            if len(parts) >= 4:
+            if len(parts) >= 4 and parts[3] not in ("-", ""):
                 return parts[3]
     return "10.0.3.20"
 
@@ -175,7 +198,14 @@ def verifier_prerequis():
 
 def collecter_credentials() -> dict:
     titre("2", "9", "Collecte des credentials")
-    print("  Credentials OpenStack lus depuis les variables d'environnement.\n")
+
+    os_password = (os.environ.get("OS_PASSWORD")
+                   or CONFIG.get("openstack", {}).get("password", ""))
+    if os_password:
+        os.environ["OS_PASSWORD"] = os_password
+        print("  Credentials OpenStack lus depuis la configuration.\n")
+    else:
+        os.environ["OS_PASSWORD"] = getpass.getpass("  Mot de passe OpenStack : ")
 
     return {
         "mariadb_root_password": getpass.getpass("  Mot de passe MariaDB root : "),
@@ -232,8 +262,10 @@ def phase_provisioning(state: State, credentials: dict, containers: list):
 
     generer_tfvars(containers, credentials)
 
+    tf_env = _terraform_env()
+
     info("terraform init...")
-    r = executer_cmd(["terraform", "init", "-no-color"], cwd=TERRAFORM_DIR)
+    r = executer_cmd(["terraform", "init", "-no-color"], cwd=TERRAFORM_DIR, env=tf_env)
     if r.returncode != 0:
         fail("terraform init")
         raise Exception("terraform init echoue")
@@ -242,14 +274,15 @@ def phase_provisioning(state: State, credentials: dict, containers: list):
     info("terraform apply...")
     r = executer_cmd(
         ["terraform", "apply", "-auto-approve", "-no-color"],
-        cwd=TERRAFORM_DIR
+        cwd=TERRAFORM_DIR,
+        env=tf_env
     )
     if r.returncode != 0:
         fail("terraform apply")
         raise Exception(f"terraform apply echoue:\n{r.stderr[-500:]}")
     ok("terraform apply")
 
-    r = executer_cmd(["terraform", "output", "-json"], cwd=TERRAFORM_DIR)
+    r = executer_cmd(["terraform", "output", "-json"], cwd=TERRAFORM_DIR, env=tf_env)
     outputs = json.loads(r.stdout)
     instances = outputs["instances"]["value"]
 
@@ -437,10 +470,21 @@ def generer_provision_yml(containers: list):
 
         if "mariadb" in c.services:
             lines += [
+                "    - name: Detection du device Cinder attache",
+                "      shell: lsblk -dpno NAME,TYPE | awk '$2==\"disk\" && $1!=\"/dev/vda\" && $1!=\"/dev/sda\" {print $1}' | head -1",
+                "      register: cinder_device_raw",
+                "      changed_when: false",
+                "    - name: Echec si aucun volume Cinder detecte",
+                "      fail:",
+                "        msg: 'Aucun volume Cinder detecte (lsblk ne trouve pas de disque secondaire)'",
+                "      when: cinder_device_raw.stdout | trim == ''",
+                "    - name: Enregistrement du device Cinder",
+                "      set_fact:",
+                "        cinder_dev: \"{{ cinder_device_raw.stdout | trim }}\"",
                 "    - name: Formatage du volume Cinder (si non formate)",
                 "      filesystem:",
                 "        fstype: ext4",
-                "        dev: /dev/vdb",
+                "        dev: \"{{ cinder_dev }}\"",
                 "    - name: Arret mariadb avant migration sur volume",
                 "      service:",
                 "        name: mariadb",
@@ -451,7 +495,7 @@ def generer_provision_yml(containers: list):
                 "        state: directory",
                 "    - name: Montage temporaire du volume",
                 "      mount:",
-                "        src: /dev/vdb",
+                "        src: \"{{ cinder_dev }}\"",
                 "        path: /mnt/mariadb-data",
                 "        fstype: ext4",
                 "        state: mounted",
@@ -465,7 +509,7 @@ def generer_provision_yml(containers: list):
                 "        state: unmounted",
                 "    - name: Montage persistant du volume sur /var/lib/mysql",
                 "      mount:",
-                "        src: /dev/vdb",
+                "        src: \"{{ cinder_dev }}\"",
                 "        path: /var/lib/mysql",
                 "        fstype: ext4",
                 "        opts: defaults,_netdev",
@@ -1095,7 +1139,7 @@ def _validate_ftp_play(c):
         "      changed_when: false",
         "",
         "    - name: Verification password hash non vide pour chaque user FTP",
-        "      shell: \"grep '^{{ item.username }}:' /etc/shadow | cut -d: -f2 | grep -qE '^\\$'\"",
+        "      shell: \"grep '^{{ item.username }}:' /etc/shadow | cut -d: -f2 | grep -q '^[$]'\"",
         '      loop: "{{ ftp_users }}"',
         "      changed_when: false",
         "      failed_when: false",
@@ -1480,7 +1524,8 @@ def rollback(state: State, erreur: str):
 
     r = executer_cmd(
         ["terraform", "destroy", "-auto-approve", "-no-color"] + target_args,
-        cwd=TERRAFORM_DIR
+        cwd=TERRAFORM_DIR,
+        env=_terraform_env()
     )
     if r.returncode == 0:
         ok("Instances OpenStack supprimees")

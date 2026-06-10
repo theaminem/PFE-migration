@@ -45,3 +45,50 @@ variable "private_subnet_cidr" {
   type        = string
   default     = "10.10.0.0/24"
 }
+
+# ─── Credentials OpenStack ────────────────────────────────────────────────────
+
+variable "os_auth_url" {
+  description = "URL d'authentification Keystone"
+  type        = string
+}
+
+variable "os_username" {
+  description = "Nom d'utilisateur OpenStack"
+  type        = string
+}
+
+variable "os_password" {
+  description = "Mot de passe OpenStack"
+  type        = string
+  sensitive   = true
+}
+
+variable "os_project_name" {
+  description = "Nom du projet/tenant OpenStack"
+  type        = string
+}
+
+variable "os_project_id" {
+  description = "ID du projet/tenant OpenStack"
+  type        = string
+  default     = ""
+}
+
+variable "os_user_domain_name" {
+  description = "Nom de domaine de l'utilisateur"
+  type        = string
+  default     = "Default"
+}
+
+variable "os_project_domain_id" {
+  description = "ID de domaine du projet"
+  type        = string
+  default     = "default"
+}
+
+variable "os_region" {
+  description = "Région OpenStack"
+  type        = string
+  default     = "RegionOne"
+}

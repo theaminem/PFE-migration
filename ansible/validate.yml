@@ -125,6 +125,21 @@
       register: ftp_mounts
       changed_when: false
 
+    - name: Verification password hash non vide pour chaque user FTP
+      shell: "grep '^{{ item.username }}:' /etc/shadow | cut -d: -f2 | grep -q '^[$]'"
+      loop: "{{ ftp_users }}"
+      changed_when: false
+      failed_when: false
+      register: ftp_hash_check
+
+    - name: Tous les users FTP ont un hash valide
+      assert:
+        that: item.rc == 0
+        fail_msg: "User FTP {{ ftp_users[ansible_loop.index0].username }} n'a pas de mot de passe"
+      loop: "{{ ftp_hash_check.results }}"
+      loop_control:
+        extended: yes
+
     - name: Creation repertoire rapport
       file:
         path: /tmp/migration

@@ -114,18 +114,28 @@
           - mariadb-server
           - mariadb-client
           - python3-pymysql
-          - rsync
         state: present
         lock_timeout: 300
-    - name: Demarrage mariadb initial (initialise /var/lib/mysql)
+    - name: Demarrage mariadb
       service:
         name: mariadb
         state: started
         enabled: true
+    - name: Detection du device Cinder attache
+      shell: lsblk -dpno NAME,TYPE | awk '$2=="disk" && $1!="/dev/vda" && $1!="/dev/sda" {print $1}' | head -1
+      register: cinder_device_raw
+      changed_when: false
+    - name: Echec si aucun volume Cinder detecte
+      fail:
+        msg: 'Aucun volume Cinder detecte (lsblk ne trouve pas de disque secondaire)'
+      when: cinder_device_raw.stdout | trim == ''
+    - name: Enregistrement du device Cinder
+      set_fact:
+        cinder_dev: "{{ cinder_device_raw.stdout | trim }}"
     - name: Formatage du volume Cinder (si non formate)
       filesystem:
         fstype: ext4
-        dev: /dev/vdb
+        dev: "{{ cinder_dev }}"
     - name: Arret mariadb avant migration sur volume
       service:
         name: mariadb
@@ -136,7 +146,7 @@
         state: directory
     - name: Montage temporaire du volume
       mount:
-        src: /dev/vdb
+        src: "{{ cinder_dev }}"
         path: /mnt/mariadb-data
         fstype: ext4
         state: mounted
@@ -150,7 +160,7 @@
         state: unmounted
     - name: Montage persistant du volume sur /var/lib/mysql
       mount:
-        src: /dev/vdb
+        src: "{{ cinder_dev }}"
         path: /var/lib/mysql
         fstype: ext4
         opts: defaults,_netdev
