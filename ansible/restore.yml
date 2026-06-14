@@ -1,6 +1,75 @@
 ---
 # Généré automatiquement par l'orchestrateur
 
+- name: Restauration db1
+  hosts: db1
+  become: true
+  tasks:
+    - name: Creation du repertoire de staging
+      file:
+        path: "{{ staging_dir }}"
+        state: directory
+        mode: '0700'
+
+    - name: Restauration des bases de données
+      community.mysql.mysql_db:
+        name: "{{ item }}"
+        state: import
+        target: "{{ staging_dir }}/db1_{{ item }}.sql"
+        login_unix_socket: /var/run/mysqld/mysqld.sock
+      loop: "{{ databases }}"
+
+    - name: Suppression ancien user appuser@ancienne_ip
+      community.mysql.mysql_user:
+        name: appuser
+        host: "{{ old_apache_ip }}"
+        state: absent
+        login_unix_socket: /var/run/mysqld/mysqld.sock
+      when: old_apache_ip != ''
+
+    - name: Creation user appuser pour apache
+      community.mysql.mysql_user:
+        name: appuser
+        host: "{{ new_ips.apache }}"
+        password: "{{ mariadb_appuser_password }}"
+        priv: "*.*:ALL"
+        state: present
+        login_unix_socket: /var/run/mysqld/mysqld.sock
+
+    - name: Creation user appuser pour web1
+      community.mysql.mysql_user:
+        name: appuser
+        host: "{{ new_ips.web1 }}"
+        password: "{{ mariadb_appuser_password }}"
+        priv: "*.*:ALL"
+        state: present
+        login_unix_socket: /var/run/mysqld/mysqld.sock
+
+    - name: Creation user appuser pour backup (lecture seule)
+      community.mysql.mysql_user:
+        name: appuser
+        host: "{{ new_ips.backup }}"
+        password: "{{ mariadb_appuser_password }}"
+        priv: "*.*:SELECT"
+        state: present
+        login_unix_socket: /var/run/mysqld/mysqld.sock
+
+    - name: Restriction bind-address MariaDB a l'IP interne
+      lineinfile:
+        path: /etc/mysql/mariadb.conf.d/50-server.cnf
+        regexp: '^bind-address'
+        line: 'bind-address = {{ instance_ip }}'
+
+    - name: Redemarrage MariaDB
+      service:
+        name: mariadb
+        state: restarted
+
+    - name: Flush privileges
+      community.mysql.mysql_query:
+        query: "FLUSH PRIVILEGES"
+        login_unix_socket: /var/run/mysqld/mysqld.sock
+
 - name: Restauration mariadb
   hosts: mariadb
   become: true
@@ -25,6 +94,7 @@
         host: "{{ old_apache_ip }}"
         state: absent
         login_unix_socket: /var/run/mysqld/mysqld.sock
+      when: old_apache_ip != ''
 
     - name: Creation user appuser pour apache
       community.mysql.mysql_user:
@@ -35,12 +105,21 @@
         state: present
         login_unix_socket: /var/run/mysqld/mysqld.sock
 
+    - name: Creation user appuser pour web1
+      community.mysql.mysql_user:
+        name: appuser
+        host: "{{ new_ips.web1 }}"
+        password: "{{ mariadb_appuser_password }}"
+        priv: "app_db.*:ALL/sysmonitor.*:ALL"
+        state: present
+        login_unix_socket: /var/run/mysqld/mysqld.sock
+
     - name: Creation user appuser pour backup (lecture seule)
       community.mysql.mysql_user:
         name: appuser
         host: "{{ new_ips.backup }}"
         password: "{{ mariadb_appuser_password }}"
-        priv: "app_db.*:SELECT"
+        priv: "app_db.*:SELECT/sysmonitor.*:SELECT"
         state: present
         login_unix_socket: /var/run/mysqld/mysqld.sock
 
@@ -70,23 +149,11 @@
         state: directory
         mode: '0700'
 
-    - name: Creation structure NFS
+    - name: Creation repertoire NFS parent
       file:
-        path: "{{ item }}"
+        path: /srv/nfs
         state: directory
         mode: '0755'
-      loop:
-        - /srv/nfs/shared
-        - /srv/nfs/shared/html
-        - /srv/nfs/shared/ftp_uploads
-        - /srv/nfs/shared/documents
-        - /srv/nfs/shared/scripts
-
-    - name: Permissions ouvertes pour le partage FTP
-      file:
-        path: /srv/nfs/shared/ftp_uploads
-        state: directory
-        mode: '0777'
 
     - name: Decompression archive NFS
       unarchive:
@@ -94,11 +161,17 @@
         dest: /srv/nfs/
         remote_src: yes
 
+    - name: Permissions ouvertes pour le partage FTP
+      file:
+        path: /srv/nfs/shared/ftp_uploads
+        state: directory
+        mode: '0777'
+
     - name: Reecriture /etc/exports avec nouveau sous-reseau
       copy:
         content: |
-          /srv/nfs/shared 10.10.0.0/24(rw,sync,no_subtree_check,no_root_squash)
-          /srv/nfs/shared/ftp_uploads 10.10.0.0/24(rw,sync,no_subtree_check,no_root_squash)
+          /srv/nfs/shared 10.10.0.0/24(rw,sync,no_subtree_check)
+          /srv/nfs/shared/ftp_uploads 10.10.0.0/24(rw,sync,no_subtree_check)
         dest: /etc/exports
 
     - name: Activation des exports NFS
@@ -123,20 +196,36 @@
         src: "{{ staging_dir }}/apache_apache2.tar.gz"
         dest: /etc/
         remote_src: yes
+    - name: Remise a zero ports.conf (evite Listen IP-specifique de l'ancien LXC)
+      copy:
+        dest: /etc/apache2/ports.conf
+        content: |
+          Listen 80
+          <IfModule ssl_module>
+              Listen 443
+          </IfModule>
+          <IfModule mod_gnutls.c>
+              Listen 443
+          </IfModule>
+    - name: Correction MPM (evite conflit mpm_event + mpm_prefork apres restauration)
+      shell: |
+        a2dismod mpm_event mpm_worker 2>/dev/null || true
+        a2enmod mpm_prefork
+      changed_when: false
+    - name: Activation module rewrite
+      command: a2enmod rewrite
+      changed_when: false
+    - name: Verification syntaxe Apache avant redemarrage
+      command: apache2ctl -t
+      changed_when: false
+      register: apache_configtest
+      failed_when: apache_configtest.rc != 0
 
-    - name: Creation du point de montage web
-      file:
-        path: /var/www/html
-        state: directory
-        mode: '0755'
-
-    - name: Montage persistant du code web depuis NFS
-      mount:
-        src: "{{ new_ips.nfs }}:/srv/nfs/shared/html"
-        path: /var/www/html
-        fstype: nfs
-        opts: defaults,_netdev
-        state: mounted
+    - name: Decompression archive HTML (pas de NFS detecte)
+      unarchive:
+        src: "{{ staging_dir }}/apache_html.tar.gz"
+        dest: /var/www/
+        remote_src: yes
 
     - name: Remplacement IP apache dans config.php
       replace:
@@ -149,6 +238,12 @@
         path: /var/www/html/config.php
         regexp: '\b10\.0\.3\.30\b'
         replace: "{{ new_ips.backup }}"
+
+    - name: Remplacement IP db1 dans config.php
+      replace:
+        path: /var/www/html/config.php
+        regexp: '\b10\.0\.3\.115\b'
+        replace: "{{ new_ips.db1 }}"
 
     - name: Remplacement IP ftp dans config.php
       replace:
@@ -168,6 +263,12 @@
         regexp: '\b10\.0\.3\.50\b'
         replace: "{{ new_ips.nfs }}"
 
+    - name: Remplacement IP web1 dans config.php
+      replace:
+        path: /var/www/html/config.php
+        regexp: '\b10\.0\.3\.203\b'
+        replace: "{{ new_ips.web1 }}"
+
     - name: Remplacement DB_PASS dans config.php
       lineinfile:
         path: /var/www/html/config.php
@@ -180,9 +281,72 @@
         block: |
           {{ new_ips.apache }} apache.migration.local
           {{ new_ips.backup }} backup.migration.local
+          {{ new_ips.db1 }} db1.migration.local
           {{ new_ips.ftp }} ftp.migration.local
           {{ new_ips.mariadb }} mariadb.migration.local
           {{ new_ips.nfs }} nfs.migration.local
+          {{ new_ips.web1 }} web1.migration.local
+    - name: Redemarrage Apache
+      service:
+        name: apache2
+        state: restarted
+
+- name: Restauration web1
+  hosts: web1
+  become: true
+  tasks:
+    - name: Creation du repertoire de staging
+      file:
+        path: "{{ staging_dir }}"
+        state: directory
+        mode: '0700'
+    - name: Decompression config Apache
+      unarchive:
+        src: "{{ staging_dir }}/web1_apache2.tar.gz"
+        dest: /etc/
+        remote_src: yes
+    - name: Remise a zero ports.conf (evite Listen IP-specifique de l'ancien LXC)
+      copy:
+        dest: /etc/apache2/ports.conf
+        content: |
+          Listen 80
+          <IfModule ssl_module>
+              Listen 443
+          </IfModule>
+          <IfModule mod_gnutls.c>
+              Listen 443
+          </IfModule>
+    - name: Correction MPM (evite conflit mpm_event + mpm_prefork apres restauration)
+      shell: |
+        a2dismod mpm_event mpm_worker 2>/dev/null || true
+        a2enmod mpm_prefork
+      changed_when: false
+    - name: Activation module rewrite
+      command: a2enmod rewrite
+      changed_when: false
+    - name: Verification syntaxe Apache avant redemarrage
+      command: apache2ctl -t
+      changed_when: false
+      register: apache_configtest
+      failed_when: apache_configtest.rc != 0
+
+    - name: Decompression archive HTML (pas de NFS detecte)
+      unarchive:
+        src: "{{ staging_dir }}/web1_html.tar.gz"
+        dest: /var/www/
+        remote_src: yes
+
+    - name: Ecriture /etc/hosts avec IPs internes
+      blockinfile:
+        path: /etc/hosts
+        block: |
+          {{ new_ips.apache }} apache.migration.local
+          {{ new_ips.backup }} backup.migration.local
+          {{ new_ips.db1 }} db1.migration.local
+          {{ new_ips.ftp }} ftp.migration.local
+          {{ new_ips.mariadb }} mariadb.migration.local
+          {{ new_ips.nfs }} nfs.migration.local
+          {{ new_ips.web1 }} web1.migration.local
     - name: Redemarrage Apache
       service:
         name: apache2

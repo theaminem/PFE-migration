@@ -17,14 +17,15 @@ variable "ssh_public_key" {
 variable "instances" {
   description = "Configuration des instances à créer"
   type = map(object({
-    flavor = string
+    flavor       = string
+    service_type = string
   }))
   default = {
-    mariadb = { flavor = "m1.medium" }
-    apache  = { flavor = "m1.medium" }
-    backup  = { flavor = "m1.medium" }
-    ftp     = { flavor = "m1.medium" }
-    nfs     = { flavor = "m1.medium" }
+    mariadb = { flavor = "m1.medium", service_type = "mariadb" }
+    apache  = { flavor = "m1.medium", service_type = "apache"  }
+    backup  = { flavor = "m1.medium", service_type = "backup"  }
+    ftp     = { flavor = "m1.medium", service_type = "ftp"     }
+    nfs     = { flavor = "m1.medium", service_type = "nfs"     }
   }
 }
 
@@ -37,6 +38,11 @@ variable "external_network_id" {
 
 variable "apache_floating_ip" {
   description = "Floating IP pré-allouée pour l'instance Apache (porte d'entrée SSH)"
+  type        = string
+}
+
+variable "gateway_instance" {
+  description = "Nom de l'instance qui reçoit la FloatingIP (gateway SSH)"
   type        = string
 }
 

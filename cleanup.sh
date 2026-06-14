@@ -6,6 +6,51 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TERRAFORM_DIR="$SCRIPT_DIR/terraform"
 ANSIBLE_DIR="$SCRIPT_DIR/ansible"
+STATE_FILE="$SCRIPT_DIR/migration_state.json"
+
+# ─── Détection dynamique des conteneurs migrés ────────────────────────────────
+# Source 1 : migration_state.json (contient service_type → volumes MariaDB)
+# Source 2 : terraform.tfstate  (fallback si state.json absent)
+
+NOMS_CONTENEURS=()
+NOMS_MARIADB=()
+
+if [[ -f "$STATE_FILE" ]]; then
+    mapfile -t NOMS_CONTENEURS < <(python3 -c "
+import json, sys
+data = json.load(open('$STATE_FILE'))
+for name in data.get('ip_mapping', {}):
+    print(name)
+" 2>/dev/null)
+    mapfile -t NOMS_MARIADB < <(python3 -c "
+import json, sys
+data = json.load(open('$STATE_FILE'))
+for name, info in data.get('ip_mapping', {}).items():
+    if info.get('service_type') == 'mariadb':
+        print(name)
+" 2>/dev/null)
+fi
+
+if [[ ${#NOMS_CONTENEURS[@]} -eq 0 && -f "$TERRAFORM_DIR/terraform.tfstate" ]]; then
+    mapfile -t NOMS_CONTENEURS < <(python3 -c "
+import json, sys
+data = json.load(open('$TERRAFORM_DIR/terraform.tfstate'))
+for res in data.get('resources', []):
+    if res.get('type') == 'openstack_compute_instance_v2' and res.get('name') == 'instances':
+        for inst in res.get('instances', []):
+            key = inst.get('index_key', '')
+            if key: print(key)
+" 2>/dev/null)
+    mapfile -t NOMS_MARIADB < <(python3 -c "
+import json, sys
+data = json.load(open('$TERRAFORM_DIR/terraform.tfstate'))
+for res in data.get('resources', []):
+    if res.get('type') == 'openstack_blockstorage_volume_v3' and res.get('name') == 'mariadb_volume':
+        for inst in res.get('instances', []):
+            key = inst.get('index_key', '')
+            if key: print(key)
+" 2>/dev/null)
+fi
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -24,14 +69,24 @@ confirmer() {
     [[ "$reponse" =~ ^[oO]$ ]]
 }
 
-# Supprime une ressource OpenStack par nom, silencieusement si absente
+# Supprime une ressource OpenStack par nom.
+# $1 peut contenir des espaces (ex: "security group") — word-splittage via tableau.
+# Distingue "not found" (warn silencieux) de vraie erreur (message explicite).
 os_delete() {
-    local type="$1"   # server / volume / keypair / security group
+    local type="$1"
     local name="$2"
-    if openstack "$type" delete "$name" 2>/dev/null; then
+    local -a type_args
+    read -ra type_args <<< "$type"
+    local output
+    if output=$(openstack "${type_args[@]}" delete "$name" 2>&1); then
         ok "Supprimé : $type '$name'"
     else
-        warn "Déjà absent ou erreur : $type '$name'"
+        if echo "$output" | grep -qiE "No [A-Za-z]+ with a name or ID|Could not find|404"; then
+            warn "Déjà absent : $type '$name'"
+        else
+            fail "Erreur : $type '$name'"
+            echo "        → $output" >&2
+        fi
     fi
 }
 
@@ -45,52 +100,84 @@ echo "╚═══════════════════════�
 echo ""
 echo "─── Étape 1 : Suppression des ressources OpenStack ───"
 echo ""
-echo "  Ressources ciblées par nom :"
-echo "    • Instances    : instance-apache, instance-backup, instance-ftp,"
-echo "                     instance-mariadb, instance-nfs"
-echo "    • Volume       : mariadb-data"
+echo "  Ressources ciblées :"
+if [[ ${#NOMS_CONTENEURS[@]} -gt 0 ]]; then
+    for n in "${NOMS_CONTENEURS[@]}"; do echo "    • Instance : instance-$n"; done
+    for n in "${NOMS_MARIADB[@]}";    do echo "    • Volume   : mariadb-data-$n"; done
+else
+    echo "    • (aucun conteneur détecté — migration_state.json et terraform.tfstate absents)"
+fi
 echo "    • Keypair      : migration-key"
 echo "    • Sec. groups  : sg-mariadb, sg-apache, sg-backup, sg-ftp, sg-nfs"
+echo "    • Réseau       : migration-router, migration-subnet, migration-net"
 
-# Vérification prérequis
 SKIP_CLOUD=0
 
+# Vérification des variables d'environnement
 if [[ -z "${OS_AUTH_URL:-}" || -z "${OS_USERNAME:-}" || -z "${OS_PASSWORD:-}" ]]; then
-    fail "Variables d'environnement OpenStack manquantes (OS_AUTH_URL, OS_USERNAME, OS_PASSWORD)"
-    echo "     Source ton fichier openrc avant de relancer ce script."
+    fail "Variables d'environnement OpenStack manquantes."
+    echo ""
+    echo "  Lance d'abord :"
+    echo "    source ~/stdmigration-openrc.sh"
+    echo "  puis relance ce script."
     SKIP_CLOUD=1
 fi
 
 if [[ $SKIP_CLOUD -eq 0 ]] && ! command -v openstack &>/dev/null; then
-    fail "CLI 'openstack' introuvable dans le PATH"
+    fail "CLI 'openstack' introuvable dans le PATH."
     SKIP_CLOUD=1
+fi
+
+# Test de connexion réel — évite le faux silence si le mot de passe est mauvais
+if [[ $SKIP_CLOUD -eq 0 ]]; then
+    echo ""
+    echo -n "  Test de connexion OpenStack... "
+    if ! openstack token issue -f value -c id &>/dev/null; then
+        echo ""
+        fail "Connexion refusée par Keystone."
+        echo "  Vérifie ton mot de passe OpenStack et relance :"
+        echo "    source ~/stdmigration-openrc.sh && bash cleanup.sh"
+        SKIP_CLOUD=1
+    else
+        echo -e "${GREEN}OK${NC}"
+    fi
 fi
 
 if [[ $SKIP_CLOUD -eq 0 ]]; then
     if confirmer "Supprimer toutes les ressources OpenStack de la migration ?"; then
 
         echo ""
-        echo "  Suppression des instances (attente de leur arrêt)..."
-        for name in instance-apache instance-backup instance-ftp instance-mariadb instance-nfs; do
-            os_delete "server" "$name"
-        done
+        echo "  Suppression des instances..."
+        if [[ ${#NOMS_CONTENEURS[@]} -gt 0 ]]; then
+            for name in "${NOMS_CONTENEURS[@]}"; do
+                os_delete "server" "instance-$name"
+            done
+        else
+            warn "Aucun conteneur détecté — instances non supprimées automatiquement."
+            warn "Lance 'terraform destroy' manuellement si des instances subsistent."
+        fi
 
-        # Attendre que les instances soient bien supprimées avant de toucher aux SG
         echo ""
-        echo "  Attente de la suppression complète des instances..."
-        for name in instance-apache instance-backup instance-ftp instance-mariadb instance-nfs; do
+        echo "  Attente de la suppression complète des instances (max 2 min)..."
+        for name in "${NOMS_CONTENEURS[@]}"; do
             for i in $(seq 1 24); do
-                if ! openstack server show "$name" &>/dev/null; then
+                if ! openstack server show "instance-$name" &>/dev/null; then
                     break
                 fi
                 sleep 5
             done
         done
-        ok "Instances supprimées"
+        ok "Instances supprimées (ou déjà absentes)"
 
         echo ""
-        echo "  Suppression du volume..."
-        os_delete "volume" "mariadb-data"
+        echo "  Suppression des volumes Cinder..."
+        if [[ ${#NOMS_MARIADB[@]} -gt 0 ]]; then
+            for name in "${NOMS_MARIADB[@]}"; do
+                os_delete "volume" "mariadb-data-$name"
+            done
+        else
+            ok "Aucun volume MariaDB détecté"
+        fi
 
         echo ""
         echo "  Suppression de la keypair..."
@@ -102,17 +189,35 @@ if [[ $SKIP_CLOUD -eq 0 ]]; then
             os_delete "security group" "$name"
         done
 
-        # Suppression explicite du réseau (OpenStack exige un ordre précis)
+        # Suppression réseau : ordre strict imposé par Neutron
         echo ""
         echo "  Suppression du réseau (router → subnet → network)..."
-        openstack router remove subnet migration-router migration-subnet 2>/dev/null && \
-            ok "Interface router détachée" || warn "Interface router déjà absente"
-        openstack router delete migration-router 2>/dev/null && \
-            ok "Router supprimé" || warn "Router déjà absent"
-        openstack network delete migration-net 2>/dev/null && \
-            ok "Réseau supprimé" || warn "Réseau déjà absent"
 
-        # Terraform destroy en complément pour purger le tfstate
+        if openstack router remove subnet migration-router migration-subnet 2>/dev/null; then
+            ok "Interface router détachée"
+        else
+            warn "Interface router déjà absente ou inexistante"
+        fi
+
+        if openstack router delete migration-router 2>/dev/null; then
+            ok "Router supprimé"
+        else
+            warn "Router déjà absent ou inexistant"
+        fi
+
+        if openstack subnet delete migration-subnet 2>/dev/null; then
+            ok "Subnet supprimé"
+        else
+            warn "Subnet déjà absent ou inexistant"
+        fi
+
+        if openstack network delete migration-net 2>/dev/null; then
+            ok "Réseau supprimé"
+        else
+            warn "Réseau déjà absent ou inexistant"
+        fi
+
+        # Terraform destroy pour purger le tfstate
         if [[ -f "$TERRAFORM_DIR/terraform.tfstate" ]] && command -v terraform &>/dev/null; then
             echo ""
             echo "  Synchronisation du tfstate Terraform..."
@@ -187,8 +292,8 @@ if confirmer "Supprimer tous ces artefacts ?"; then
     CLOUD_HV_COUNT=0
     for f in "$ANSIBLE_DIR/host_vars"/*.yml; do
         [[ -f "$f" ]] || continue
-        basename=$(basename "$f")
-        [[ "$basename" =~ ^10\.0\. ]] && continue  # conserver les host_vars LXC
+        hv_basename=$(basename "$f")
+        [[ "$hv_basename" =~ ^10\.0\. ]] && continue  # conserver les host_vars LXC
         rm -f "$f"
         CLOUD_HV_COUNT=$((CLOUD_HV_COUNT + 1))
     done

@@ -91,11 +91,13 @@ class State:
     # ─── Gestion des IPs ──────────────────────────────────────────────────────
 
     def enregistrer_ip(self, nom: str, lxc_ip: str,
-                       internal_ip: str, floating_ip: str):
+                       internal_ip: str, floating_ip: str,
+                       service_type: str = ""):
         self.ip_mapping[nom] = {
-            "lxc_ip"      : lxc_ip,
-            "internal_ip" : internal_ip,
-            "floating_ip" : floating_ip,
+            "lxc_ip"       : lxc_ip,
+            "internal_ip"  : internal_ip,
+            "floating_ip"  : floating_ip,
+            "service_type" : service_type,
         }
         self.sauvegarder()
 

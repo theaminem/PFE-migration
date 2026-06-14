@@ -6,11 +6,11 @@ output "instances" {
     for k, v in openstack_compute_instance_v2.instances :
     k => {
       ip          = v.access_ip_v4
-      floating_ip = k == "apache" ? openstack_compute_floatingip_associate_v2.apache_fip.floating_ip : v.access_ip_v4
+      floating_ip = var.instances[k].service_type == "apache" ? openstack_compute_floatingip_associate_v2.apache_fip.floating_ip : v.access_ip_v4
     }
   }
 }
 
 output "mariadb_volume_device" {
-  value = openstack_compute_volume_attach_v2.mariadb_volume_attach.device
+  value = { for k, v in openstack_compute_volume_attach_v2.mariadb_volume_attach : k => v.device }
 }

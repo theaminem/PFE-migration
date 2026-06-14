@@ -79,6 +79,85 @@
         state: present
         lock_timeout: 300
 
+- name: Provisionnement db1
+  hosts: db1
+  become: true
+  gather_facts: no
+  tasks:
+    - name: Attente liberation verrou apt
+      shell: while fuser /var/lib/apt/lists/lock /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/cache/apt/archives/lock >/dev/null 2>&1; do sleep 2; done
+      changed_when: false
+    - name: Installation paquets db1
+      apt:
+        name:
+          - mariadb-server
+          - mariadb-client
+          - python3-pymysql
+        state: present
+        lock_timeout: 300
+    - name: Demarrage mariadb
+      service:
+        name: mariadb
+        state: started
+        enabled: true
+    - name: Detection du device Cinder attache
+      shell: lsblk -dpno NAME,TYPE | awk '$2=="disk" && $1!="/dev/vda" && $1!="/dev/sda" {print $1}' | head -1
+      register: cinder_device_raw
+      changed_when: false
+    - name: Echec si aucun volume Cinder detecte
+      fail:
+        msg: 'Aucun volume Cinder detecte (lsblk ne trouve pas de disque secondaire)'
+      when: cinder_device_raw.stdout | trim == ''
+    - name: Enregistrement du device Cinder
+      set_fact:
+        cinder_dev: "{{ cinder_device_raw.stdout | trim }}"
+    - name: Volume Cinder detecte
+      debug:
+        msg: "Volume Cinder trouve : {{ cinder_dev }}"
+    - name: Formatage du volume Cinder (si non formate)
+      filesystem:
+        fstype: ext4
+        dev: "{{ cinder_dev }}"
+    - name: Arret mariadb avant migration sur volume
+      service:
+        name: mariadb
+        state: stopped
+    - name: Creation point de montage temporaire
+      file:
+        path: /mnt/mariadb-data
+        state: directory
+    - name: Montage temporaire du volume
+      mount:
+        src: "{{ cinder_dev }}"
+        path: /mnt/mariadb-data
+        fstype: ext4
+        state: mounted
+    - name: Copie des donnees MariaDB vers le volume
+      command: rsync -a /var/lib/mysql/ /mnt/mariadb-data/
+      args:
+        creates: /mnt/mariadb-data/mysql
+    - name: Demontage temporaire
+      mount:
+        path: /mnt/mariadb-data
+        state: unmounted
+    - name: Montage persistant du volume sur /var/lib/mysql
+      mount:
+        src: "{{ cinder_dev }}"
+        path: /var/lib/mysql
+        fstype: ext4
+        opts: defaults,_netdev
+        state: mounted
+    - name: Correction des permissions sur le volume
+      file:
+        path: /var/lib/mysql
+        owner: mysql
+        group: mysql
+        recurse: yes
+    - name: Demarrage mariadb sur le volume Cinder
+      service:
+        name: mariadb
+        state: started
+
 - name: Provisionnement ftp
   hosts: ftp
   become: true
@@ -132,6 +211,9 @@
     - name: Enregistrement du device Cinder
       set_fact:
         cinder_dev: "{{ cinder_device_raw.stdout | trim }}"
+    - name: Volume Cinder detecte
+      debug:
+        msg: "Volume Cinder trouve : {{ cinder_dev }}"
     - name: Formatage du volume Cinder (si non formate)
       filesystem:
         fstype: ext4
@@ -194,5 +276,30 @@
     - name: Demarrage nfs-kernel-server
       service:
         name: nfs-kernel-server
+        state: started
+        enabled: true
+
+- name: Provisionnement web1
+  hosts: web1
+  become: true
+  gather_facts: no
+  tasks:
+    - name: Attente liberation verrou apt
+      shell: while fuser /var/lib/apt/lists/lock /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/cache/apt/archives/lock >/dev/null 2>&1; do sleep 2; done
+      changed_when: false
+    - name: Installation paquets web1
+      apt:
+        name:
+          - apache2
+          - php
+          - libapache2-mod-php
+          - php-mysql
+          - php-curl
+          - nfs-common
+        state: present
+        lock_timeout: 300
+    - name: Demarrage apache2
+      service:
+        name: apache2
         state: started
         enabled: true

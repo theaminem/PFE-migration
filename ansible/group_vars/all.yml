@@ -5,8 +5,10 @@ ansible_ssh_private_key_file: ~/.ssh/migration_key
 ansible_ssh_common_args: '-o StrictHostKeyChecking=no'
 staging_dir: "/tmp/migration_staging"
 new_ips:
-  apache: "10.10.0.71"
-  backup: "10.10.0.253"
-  ftp: "10.10.0.194"
-  mariadb: "10.10.0.52"
-  nfs: "10.10.0.227"
+  apache: "10.10.0.212"
+  backup: "10.10.0.140"
+  db1: "10.10.0.230"
+  ftp: "10.10.0.57"
+  mariadb: "10.10.0.197"
+  nfs: "10.10.0.188"
+  web1: "10.10.0.174"

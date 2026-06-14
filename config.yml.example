@@ -1,30 +1,37 @@
 # ─── Authentification OpenStack ───────────────────────────────────────────────
 openstack:
-  auth_url:        "https://dash.cloud.cerist.dz:5000/v3"
-  region:          "RegionOne"
-  default_user:    "migration-user"
-  default_project: "migration"
+  auth_url:          "https://<IP_VM_CIBLE>:5000"   # URL Keystone (avec /v3 si requis)
+  default_user:      "stdmigration"                  # Utilisateur OpenStack
+  default_project:   "stdmigration"                  # Projet / tenant OpenStack
+  project_id:        "<ID-du-projet>"                # ID du projet (Keystone → Projects)
+  user_domain_name:  "Default"                       # Domaine de l'utilisateur
+  project_domain_id: "default"                       # ID du domaine du projet
+  region:            "RegionOne"                     # Région OpenStack
+  password:          ""                              # Laisser vide → demandé interactivement
 
 # ─── Réseau ───────────────────────────────────────────────────────────────────
 network:
-  external_network_id: "<ID-du-PublicNetwork-OpenStack>"
-  api_ip:              "dash.cloud.cerist.dz"
-  apache_floating_ip:  "<IP-flottante-allouée-pour-Apache>"
-  private_subnet_cidr: "10.10.0.0/24"
+  gateway_container:   "apache"                      # Nom du conteneur LXC qui reçoit la FloatingIP
+  external_network_id: "<ID-du-PublicNetwork>"       # ID du réseau provider (openstack network list)
+  api_ip:              "<IP_ou_DNS_VM_CIBLE>"        # Adresse pingée en prérequis
+  apache_floating_ip:  "<Floating-IP-allouée>"       # IP flottante pré-allouée pour Apache
+  private_subnet_cidr: "10.10.0.0/24"               # CIDR du réseau interne des instances
 
 # ─── Image de base ────────────────────────────────────────────────────────────
 image:
-  name: "ubuntu-noble-24.04-amd64"
+  name: "ubuntu-noble-24.04-amd64"                  # Nom exact de l'image dans Glance
 
 # ─── SSH ──────────────────────────────────────────────────────────────────────
 ssh:
-  key_path: "~/.ssh/migration_key"
-  user:     "ubuntu"
+  key_path: "~/.ssh/migration_key"                  # Clé privée SSH (la .pub sera lue aussi)
+  user:     "ubuntu"                                 # User par défaut des images Ubuntu cloud
 
 # ─── Répertoire de staging sur les instances distantes ────────────────────────
-staging_dir: "/tmp/migration"
+staging_dir: "/tmp/migration_staging"
 
-# ─── Flavors par service ──────────────────────────────────────────────────────
+# ─── Flavors par nom de conteneur ─────────────────────────────────────────────
+# La clé est le NOM du conteneur LXC (pas le type de service).
+# "default" s'applique à tout conteneur sans entrée dédiée.
 flavors:
   mariadb: "m1.small"
   apache:  "m1.small"

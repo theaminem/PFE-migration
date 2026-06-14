@@ -17,8 +17,9 @@
 7. [Provisioning Terraform dynamique](#7-provisioning-terraform-dynamique)
 8. [Sécurité](#8-sécurité)
 9. [Comment reproduire la migration de zéro](#9-comment-reproduire-la-migration-de-zéro)
-10. [Structure du projet](#10-structure-du-projet)
-11. [Erreurs de conception corrigées](#11-erreurs-de-conception-corrigées)
+10. [Nettoyage et remise à zéro](#10-nettoyage-et-remise-à-zéro)
+11. [Structure du projet](#11-structure-du-projet)
+12. [Erreurs de conception corrigées](#12-erreurs-de-conception-corrigées)
 
 ---
 
@@ -1101,7 +1102,376 @@ curl http://{FLOATING_IP_APACHE}/
 
 ---
 
-## 10. Structure du projet
+## 10. Nettoyage et remise à zéro
+
+Après une migration (réussie ou échouée), `cleanup.sh` supprime toutes les ressources créées sur OpenStack et efface les artefacts locaux générés. Il permet de repartir d'un état propre pour relancer une migration.
+
+### Prérequis
+
+```bash
+source ~/stdmigration-openrc.sh   # charge les variables OS_AUTH_URL, OS_USERNAME, OS_PASSWORD
+```
+
+### Lancer le nettoyage
+
+```bash
+bash cleanup.sh
+```
+
+Le script pose deux questions de confirmation :
+1. Supprimer les ressources OpenStack (instances, volume, keypair, security groups, réseau)
+2. Supprimer les artefacts locaux (tfstate, playbooks générés, inventory, migration_state.json)
+
+### Ce que le script supprime
+
+**Ressources OpenStack (ordre strict imposé par Neutron) :**
+
+| Ordre | Ressource | Raison de l'ordre |
+|-------|-----------|-------------------|
+| 1 | Floating IP association (`apache_fip`) | doit être libérée avant de supprimer l'instance |
+| 2 | Volume attach (`mariadb_volume_attach`) | doit être détaché avant de supprimer instance et volume |
+| 3 | Volume (`mariadb-data`) | doit être détaché avant suppression |
+| 4 | Instances Nova (×5) | doivent être supprimées avant les security groups |
+| 5 | Security groups (×5) | ne peuvent pas être supprimés si des ports les utilisent encore |
+| 6 | Interface router → subnet | doit être retirée avant de supprimer le router |
+| 7 | Router (`migration-router`) | doit être vide avant suppression |
+| 8 | Subnet (`migration-subnet`) | doit être sans router avant suppression |
+| 9 | Réseau (`migration-net`) | supprimé en dernier |
+
+> Le keypair `migration-key` est supprimé entre les instances et les security groups.
+
+**Artefacts locaux :**
+- `migration_state.json`, `migration_report.json`
+- `terraform/terraform.tfstate`, `terraform/terraform.tfstate.backup`
+- `ansible/inventory.ini`, `ansible/group_vars/all.yml`
+- `ansible/provision.yml`, `ansible/restore.yml`, `ansible/validate.yml`
+- `ansible/host_vars/*.yml` (sauf les fichiers `10.0.*.yml` qui sont les host_vars LXC)
+
+### Relancer après nettoyage
+
+```bash
+python3 src/migrate.py
+```
+
+### En cas d'échec du nettoyage
+
+Si `cleanup.sh` échoue à supprimer certaines ressources (timeout réseau, dépendances résiduelles), vérifier manuellement :
+
+```bash
+openstack server list           # instances restantes
+openstack volume list           # volumes restants
+openstack security group list   # security groups restants
+openstack network list          # réseaux restants
+```
+
+Puis supprimer manuellement ce qui reste :
+
+```bash
+openstack server delete instance-apache instance-mariadb ...
+openstack volume delete mariadb-data
+openstack security group delete sg-mariadb sg-apache ...
+openstack router remove subnet migration-router migration-subnet
+openstack router delete migration-router
+openstack subnet delete migration-subnet
+openstack network delete migration-net
+```
+
+---
+
+## 11. Tests post-migration
+
+> Les commandes de test sont dans `TESTS.md` à la racine du projet.
+
+Cette section décrit les procédures de vérification à effectuer après chaque migration. Les commandes utilisent des **variables shell** à définir une seule fois depuis `migration_state.json` — elles sont valables pour n'importe quel run.
+
+### Définir les variables de session
+
+```bash
+# Lire les IPs depuis le rapport de migration
+APACHE_FIP=$(python3 -c "import json; d=json.load(open('migration_report.json')); print(d['instances']['apache'].get('floating_ip', d['instances']['apache']['ip']))")
+MARIADB_IP=$(python3 -c "import json; d=json.load(open('migration_report.json')); print(d['instances']['mariadb']['ip'])")
+NFS_IP=$(python3 -c "import json; d=json.load(open('migration_report.json')); print(d['instances']['nfs']['ip'])")
+FTP_IP=$(python3 -c "import json; d=json.load(open('migration_report.json')); print(d['instances']['ftp']['ip'])")
+BACKUP_IP=$(python3 -c "import json; d=json.load(open('migration_report.json')); print(d['instances']['backup']['ip'])")
+SSH_KEY=~/.ssh/migration_key
+
+echo "Apache  : $APACHE_FIP"
+echo "MariaDB : $MARIADB_IP"
+echo "NFS     : $NFS_IP"
+echo "FTP     : $FTP_IP"
+echo "Backup  : $BACKUP_IP"
+```
+
+Alias SSH pour la session (évite de retaper le ProxyJump à chaque fois) :
+
+```bash
+alias ssh-apache="ssh -i $SSH_KEY -o StrictHostKeyChecking=no ubuntu@$APACHE_FIP"
+alias ssh-mariadb="ssh -i $SSH_KEY -o StrictHostKeyChecking=no -o ProxyCommand=\"ssh -i $SSH_KEY -o StrictHostKeyChecking=no -W %h:22 ubuntu@$APACHE_FIP\" ubuntu@$MARIADB_IP"
+alias ssh-nfs="ssh -i $SSH_KEY -o StrictHostKeyChecking=no -o ProxyCommand=\"ssh -i $SSH_KEY -o StrictHostKeyChecking=no -W %h:22 ubuntu@$APACHE_FIP\" ubuntu@$NFS_IP"
+alias ssh-ftp="ssh -i $SSH_KEY -o StrictHostKeyChecking=no -o ProxyCommand=\"ssh -i $SSH_KEY -o StrictHostKeyChecking=no -W %h:22 ubuntu@$APACHE_FIP\" ubuntu@$FTP_IP"
+alias ssh-backup="ssh -i $SSH_KEY -o StrictHostKeyChecking=no -o ProxyCommand=\"ssh -i $SSH_KEY -o StrictHostKeyChecking=no -W %h:22 ubuntu@$APACHE_FIP\" ubuntu@$BACKUP_IP"
+```
+
+### Health check global (30 secondes)
+
+Coller ce bloc tel quel après avoir défini les variables ci-dessus :
+
+```bash
+echo "--- HTTP Apache ---"
+curl -o /dev/null -sw "HTTP %{http_code}\n" http://$APACHE_FIP
+
+echo "--- Apache service ---"
+ssh-apache "systemctl is-active apache2"
+
+echo "--- NFS monté sur Apache ---"
+ssh-apache "mount | grep -c '/var/www/html' && echo 'OK' || echo 'NON MONTE'"
+
+echo "--- MariaDB service + volume Cinder ---"
+ssh-mariadb "systemctl is-active mariadb && mount | grep -q '/var/lib/mysql' && echo 'volume OK' || echo 'volume NON MONTE'"
+
+echo "--- NFS service + exports ---"
+ssh-nfs "systemctl is-active nfs-kernel-server && exportfs -v | wc -l | xargs -I{} echo '{} exports actifs'"
+
+echo "--- FTP service + montages NFS ---"
+ssh-ftp "systemctl is-active vsftpd && mount | grep -c nfs | xargs -I{} echo '{} montages NFS'"
+
+echo "--- Backup script ---"
+ssh-backup "test -f /usr/local/bin/backup.sh && echo 'script OK' || echo 'ABSENT'"
+```
+
+**Résultat attendu :** `HTTP 200`, tous les services `active`, volume OK, exports > 0, montages NFS > 0, script OK.
+
+---
+
+### Test 1 — Apache
+
+```bash
+ssh-apache
+```
+
+```bash
+# Service actif
+systemctl is-active apache2
+
+# NFS monté sur /var/www/html
+mount | grep '/var/www/html'
+
+# Pas d'anciennes IPs LXC dans config.php (toutes remplacées par 10.10.x.x)
+grep -E '10\.0\.3\.' /var/www/html/config.php || echo "OK — aucune ancienne IP"
+
+# Nouvelles IPs présentes
+grep -E '10\.10\.' /var/www/html/config.php
+
+# HTTP répond
+curl -o /dev/null -sw "%{http_code}\n" http://localhost
+
+# Logs d'erreurs récents
+sudo tail -20 /var/log/apache2/error.log
+```
+
+| Vérification | Résultat attendu |
+|---|---|
+| `systemctl is-active apache2` | `active` |
+| `mount \| grep /var/www/html` | ligne avec `nfs` |
+| `grep 10.0.3. config.php` | vide (aucune ancienne IP) |
+| `curl http://localhost` | `200` |
+
+---
+
+### Test 2 — MariaDB
+
+```bash
+ssh-mariadb
+```
+
+```bash
+# Service actif
+systemctl is-active mariadb
+
+# Volume Cinder monté sur /var/lib/mysql
+mount | grep '/var/lib/mysql'
+df -h /var/lib/mysql   # doit afficher ~10G
+
+# Bases de données présentes
+sudo mysql -e "SHOW DATABASES;" | grep -E 'app_db|sysmonitor'
+
+# User appuser existe avec les bonnes IPs
+sudo mysql -e "SELECT user, host FROM mysql.user WHERE user='appuser';"
+
+# MariaDB écoute sur l'IP interne (pas 0.0.0.0)
+sudo grep 'bind-address' /etc/mysql/mariadb.conf.d/50-server.cnf
+
+# Test de connexion depuis apache (simulé)
+sudo mysql -u appuser -p -h $MARIADB_IP app_db -e "SHOW TABLES;" 2>/dev/null || echo "tester depuis l'instance apache"
+```
+
+| Vérification | Résultat attendu |
+|---|---|
+| `systemctl is-active mariadb` | `active` |
+| `mount \| grep /var/lib/mysql` | ligne avec `ext4` ou `vdb` |
+| `SHOW DATABASES` | `app_db` et `sysmonitor` présentes |
+| `SELECT user, host` | `appuser` avec les IPs `$APACHE_IP` et `$BACKUP_IP` |
+| `bind-address` | IP interne de l'instance (pas `0.0.0.0`) |
+
+---
+
+### Test 3 — NFS
+
+```bash
+ssh-nfs
+```
+
+```bash
+# Service actif
+systemctl is-active nfs-kernel-server
+
+# Exports actifs avec le bon sous-réseau (10.10.0.0/24, pas l'ancien 10.0.3.0/24)
+sudo exportfs -v
+
+# Fichiers web présents
+ls /srv/nfs/shared/html/
+
+# Répertoire FTP présent
+ls /srv/nfs/shared/ftp_uploads/
+
+# Test de montage depuis apache
+# (depuis l'instance apache) : showmount -e $NFS_IP
+```
+
+| Vérification | Résultat attendu |
+|---|---|
+| `systemctl is-active nfs-kernel-server` | `active` |
+| `exportfs -v` | exports sur `10.10.0.0/24` (nouveau sous-réseau) |
+| `ls /srv/nfs/shared/html/` | `index.php` et fichiers du site |
+| `ls /srv/nfs/shared/ftp_uploads/` | répertoires des users FTP |
+
+---
+
+### Test 4 — FTP
+
+```bash
+ssh-ftp
+```
+
+```bash
+# Service actif
+systemctl is-active vsftpd
+
+# Users FTP créés
+id ftpuser; id ftpuser1; id ftpuser2
+
+# Hashes de mots de passe présents (commencent par $y$ = yescrypt)
+sudo grep -E '^ftpuser' /etc/shadow | cut -d: -f1,2
+
+# Montages NFS sur les répertoires /files de chaque user
+mount | grep nfs
+
+# Configuration vsftpd : mode passif et chroot
+grep -E 'pasv_min|pasv_max|chroot_local' /etc/vsftpd.conf
+
+# Test FTP via tunnel SSH (depuis ton poste) :
+# ssh -i $SSH_KEY -L 2121:$FTP_IP:21 ubuntu@$APACHE_FIP -N &
+# ftp localhost 2121  → login: ftpuser, password: (mot de passe original du LXC)
+```
+
+| Vérification | Résultat attendu |
+|---|---|
+| `systemctl is-active vsftpd` | `active` |
+| `id ftpuser` | uid et gid présents |
+| `/etc/shadow` | hashes commençant par `$y$` |
+| `mount \| grep nfs` | un montage NFS par user FTP |
+| `vsftpd.conf` | `pasv_min_port=40000`, `chroot_local_user=YES` |
+
+> **Note :** les mots de passe FTP sont ceux du container LXC source (hashes copiés à l'identique). Si tu ne les connais plus : `sudo passwd ftpuser` depuis l'instance FTP.
+
+---
+
+### Test 5 — Backup
+
+```bash
+ssh-backup
+```
+
+```bash
+# Script présent et exécutable
+ls -la /usr/local/bin/backup.sh
+
+# Nouvelle IP MariaDB dans le script (pas l'ancienne IP LXC)
+grep 'HOST=' /usr/local/bin/backup.sh
+
+# Base cible correcte
+grep 'DB=' /usr/local/bin/backup.sh
+
+# Options mysqldump présentes (--single-transaction --skip-lock-tables)
+grep 'single-transaction' /usr/local/bin/backup.sh
+
+# Cron actif et job configuré
+systemctl is-active cron
+sudo crontab -l
+
+# Test manuel du backup
+sudo /usr/local/bin/backup.sh
+
+# Vérifier le fichier créé
+ls -lh /backups/
+```
+
+| Vérification | Résultat attendu |
+|---|---|
+| `ls /usr/local/bin/backup.sh` | fichier présent et exécutable |
+| `grep HOST=` | IP interne de l'instance MariaDB |
+| `grep DB=` | `app_db` |
+| `systemctl is-active cron` | `active` |
+| `sudo crontab -l` | entrée cron avec `backup.sh` |
+| `ls /backups/` | fichier daté du jour après test manuel |
+
+---
+
+### Test 6 — Connectivité inter-services
+
+Depuis l'instance Apache, tester que chaque service interne est joignable :
+
+```bash
+ssh-apache
+```
+
+```bash
+# Ping toutes les instances sur le réseau interne
+for ip in $MARIADB_IP $NFS_IP $FTP_IP $BACKUP_IP; do
+    ping -c 1 -W 2 $ip &>/dev/null && echo "$ip OK" || echo "$ip ECHEC"
+done
+
+# Port MariaDB 3306 ouvert
+nc -zv $MARIADB_IP 3306
+
+# NFS exports visibles
+showmount -e $NFS_IP
+
+# Port FTP 21 ouvert
+nc -zv $FTP_IP 21
+```
+
+| Vérification | Résultat attendu |
+|---|---|
+| `ping` vers chaque instance | `OK` pour les 4 |
+| `nc -zv $MARIADB_IP 3306` | `succeeded` |
+| `showmount -e $NFS_IP` | exports listés |
+
+---
+
+### Tableau de dépannage
+
+| Symptôme | Instance | Commande |
+|----------|----------|----------|
+| HTTP 500 ou page blanche | apache | `sudo tail -50 /var/log/apache2/error.log` |
+| NFS non monté sur Apache | apache | `sudo mount -a && mount \| grep nfs` |
+| MariaDB ne démarre pas | mariadb | `sudo journalctl -u mariadb --no-pager -n 30` |
+| Volume Cinder non monté | mariadb | `lsblk && sudo mount -a` |
+| FTP connexion refusée | ftp | `sudo journalctl -u vsftpd --no-pager -n 20` |
+| Backup échoue | backup | `sudo bash -x /usr/local/bin/backup.sh 2>&1` |
+---
+
+## 11. Structure du projet
 
 ```
 PFE-migration/
@@ -1178,7 +1548,7 @@ Configuration optimisée :
 
 ---
 
-## 11. Erreurs de conception corrigées
+## 12. Erreurs de conception corrigées
 
 Cette section documente les problèmes identifiés et corrigés pendant le développement du projet. Elle est utile pour comprendre les choix techniques et éviter de réintroduire les mêmes erreurs.
 
@@ -1297,4 +1667,45 @@ if "vsftpd" in c.services:
 
 ---
 
-*Document généré le 2026-05-10. Pour toute question, contacter les auteurs via le repository GitHub.*
+### ERR-08 — `os_delete "security group"` : type multi-mots passé comme un seul argument
+
+**Problème :** la fonction `os_delete` dans `cleanup.sh` appelle `openstack "$type" delete "$name"`. Quand `$type` vaut `"security group"` (avec espace), bash le passe comme un **seul token** à la commande `openstack`. Le CLI OpenStack reçoit `["security group", "delete", "sg-mariadb"]` au lieu de `["security", "group", "delete", "sg-mariadb"]` — commande non reconnue, tous les security groups tombent dans le `else`/warn sans jamais être supprimés.
+
+**Correction :** word-split le type en tableau avec `read -ra` :
+
+```bash
+read -ra type_args <<< "$type"
+openstack "${type_args[@]}" delete "$name"
+```
+
+---
+
+### ERR-09 — Rollback silencieux : `capture_output=True` masquait la sortie Terraform
+
+**Problème :** la fonction `rollback()` appelait `executer_cmd()` qui utilise `capture_output=True`. Terraform tournait en silence pendant plusieurs minutes — l'utilisateur ne voyait rien et pensait que le processus était bloqué.
+
+**Correction :** le rollback appelle `subprocess.run` directement sans `capture_output`, avec un timeout explicite de 15 minutes. Terraform écrit maintenant en temps réel dans le terminal.
+
+---
+
+### ERR-10 — `%p` non substitué dans le ProxyCommand Ansible → port 65535
+
+**Problème :** l'inventaire généré contenait :
+```
+ansible_ssh_common_args='-o ProxyCommand="ssh ... -W %h:%p ubuntu@FIP"'
+```
+Les guillemets imbriqués (simple à l'extérieur, double à l'intérieur) empêchaient la substitution de `%p` par Ansible. OpenSSH utilisait la valeur sentinel `65535` (0xFFFF) comme port — timeout systématique pour toutes les instances internes.
+
+**Correction :** remplacer `%h:%p` par `%h:22` (port SSH fixe, toujours 22 pour les instances du projet).
+
+---
+
+### ERR-11 — Timeout volume detach trop court (5 min) sur CERIST
+
+**Problème :** `main.tf` déclarait `delete = "5m"` pour `openstack_compute_volume_attach_v2`. Sur l'OpenStack CERIST, le détachement d'un volume Cinder peut prendre jusqu'à 15 minutes. Terraform abandonnait avant la fin → rollback incomplet → volume restait attaché → re-run impossible.
+
+**Correction :** `delete = "20m"` dans le timeout du volume attach.
+
+---
+
+*Document mis à jour le 2026-06-10. Pour toute question, contacter les auteurs via le repository GitHub.*

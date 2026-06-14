@@ -30,6 +30,92 @@ SSH_KEY = Path(CONFIG["ssh"]["key_path"]).expanduser()
 
 # ─── Affichage ────────────────────────────────────────────────────────────────
 
+def _detect_service_type(c) -> str:
+    """Retourne le type de service principal d'un conteneur."""
+    if "mariadb"    in c.services: return "mariadb"
+    if "apache2"    in c.services: return "apache"
+    if "nfs-server" in c.services: return "nfs"
+    if "vsftpd"     in c.services: return "ftp"
+    if c.backup_config is not None: return "backup"
+    return "backup"
+
+
+def _detecter_gateway(containers: list) -> str:
+    """Retourne le nom du conteneur gateway Apache.
+
+    Priorité : config.yml → auto-détection si unique → erreur si ambigu.
+    """
+    configured = CONFIG["network"].get("gateway_container", "")
+    if configured:
+        match = [c for c in containers if c.name == configured]
+        if not match:
+            raise RuntimeError(
+                f"gateway_container '{configured}' introuvable parmi les conteneurs LXC détectés."
+            )
+        if _detect_service_type(match[0]) != "apache":
+            raise RuntimeError(
+                f"gateway_container '{configured}' ne tourne pas apache2."
+            )
+        print(f"  Gateway configuré : {configured}")
+        return configured
+
+    apache_containers = [c for c in containers if _detect_service_type(c) == "apache"]
+    if len(apache_containers) == 0:
+        raise RuntimeError("Aucun conteneur Apache détecté — gateway introuvable.")
+    if len(apache_containers) == 1:
+        print(f"  Gateway détecté automatiquement : {apache_containers[0].name}")
+        return apache_containers[0].name
+    noms = ", ".join(c.name for c in apache_containers)
+    raise RuntimeError(
+        f"Plusieurs conteneurs Apache détectés ({noms}). "
+        f"Définissez 'gateway_container' dans config.yml."
+    )
+
+
+def _trouver_nfs(nfs_containers: list, mot_cle: str):
+    """Retourne (container, export_path) du NFS dont un export contient mot_cle, ou (None, None)."""
+    for n in nfs_containers:
+        for e in n.nfs_exports:
+            if mot_cle in e.path.lower():
+                return n, e.path
+    return None, None
+
+
+def _mariadb_pour_backup(c, mariadb_containers: list):
+    """Associe un conteneur backup à son MariaDB via l'ancienne IP dans backup.sh."""
+    if not mariadb_containers:
+        return None
+    if c.backup_config and c.backup_config.host:
+        for m in mariadb_containers:
+            if m.ip == c.backup_config.host:
+                return m
+    return mariadb_containers[0]
+
+
+def _nfs_archive_root(c) -> tuple:
+    """Retourne (parent_path, subdir) pour archiver/restaurer les données NFS.
+
+    Détermine le dossier racine à archiver depuis les exports NFS réels du conteneur.
+    Ex: exports ['/srv/nfs/shared', '/srv/nfs/shared/ftp_uploads'] → ('/srv/nfs', 'shared')
+    """
+    if not c.nfs_exports:
+        return "/srv/nfs", "shared"
+    from pathlib import PurePosixPath
+    paths = [PurePosixPath(e.path) for e in c.nfs_exports]
+    parts_sets = [list(p.parts) for p in paths]
+    min_len = min(len(p) for p in parts_sets)
+    common = []
+    for i in range(min_len):
+        if all(p[i] == parts_sets[0][i] for p in parts_sets):
+            common.append(parts_sets[0][i])
+        else:
+            break
+    if len(common) <= 1:
+        return "/srv/nfs", "shared"
+    common_path = PurePosixPath(*common)
+    return str(common_path.parent), common_path.name
+
+
 def titre(etape: str, total: int, texte: str):
     print(f"\n[{etape}/{total}] {texte}")
     print("-" * 50)
@@ -79,6 +165,9 @@ def _terraform_env() -> dict:
                                         or os_cfg.get("project_domain_id", "default")),
         "TF_VAR_os_region":            (os.environ.get("OS_REGION_NAME")
                                         or os_cfg.get("region", "RegionOne")),
+        "TF_VAR_apache_floating_ip":   CONFIG.get("network", {}).get("apache_floating_ip", ""),
+        "TF_VAR_external_network_id":  CONFIG.get("network", {}).get("external_network_id", ""),
+        "TF_VAR_gateway_instance":     CONFIG.get("network", {}).get("gateway_container", ""),
     })
     return env
 
@@ -116,10 +205,10 @@ def attendre_ssh(ip: str, timeout: int = 120, proxy_ip: str = None):
 IPTABLES_CHAIN = "MIGRATION"
 
 
-def _get_lxc_apache_ip() -> str:
+def _get_lxc_apache_ip(gateway: str) -> str:
     r = executer_cmd(["sudo", "lxc-ls", "--fancy"])
     for line in r.stdout.splitlines():
-        if line.startswith("apache") and "RUNNING" in line:
+        if line.startswith(gateway) and "RUNNING" in line:
             parts = line.split()
             if len(parts) >= 4 and parts[3] not in ("-", ""):
                 return parts[3]
@@ -176,10 +265,10 @@ def verifier_prerequis():
             fail(nom)
             erreurs.append(nom)
 
-    if SSH_KEY.exists():
+    if SSH_KEY.exists() and Path(str(SSH_KEY) + ".pub").exists():
         ok("cle SSH")
     else:
-        fail("cle SSH")
+        fail("cle SSH (verifie que ~/.ssh/migration_key et migration_key.pub existent)")
         erreurs.append("ssh_key")
 
     r = executer_cmd(["ping", "-c", "1", "-W", "2", CONFIG["network"]["api_ip"]])
@@ -196,7 +285,7 @@ def verifier_prerequis():
 
 # ─── Collecte des credentials ─────────────────────────────────────────────────
 
-def collecter_credentials() -> dict:
+def collecter_credentials(containers: list) -> dict:
     titre("2", "9", "Collecte des credentials")
 
     os_password = (os.environ.get("OS_PASSWORD")
@@ -207,18 +296,26 @@ def collecter_credentials() -> dict:
     else:
         os.environ["OS_PASSWORD"] = getpass.getpass("  Mot de passe OpenStack : ")
 
-    return {
-        "mariadb_root_password": getpass.getpass("  Mot de passe MariaDB root : "),
-        "mariadb_app_password":  getpass.getpass("  Mot de passe MariaDB appuser : "),
-    }
+    creds = {"mariadb_root_passwords": {}, "mariadb_app_password": ""}
+    mariadb_containers = [c for c in containers if "mariadb" in c.services]
+    if mariadb_containers:
+        for c in mariadb_containers:
+            creds["mariadb_root_passwords"][c.name] = getpass.getpass(
+                f"  Mot de passe MariaDB root pour {c.name} : "
+            )
+        creds["mariadb_app_password"] = getpass.getpass("  Mot de passe MariaDB appuser : ")
+
+    creds["gateway"] = _detecter_gateway(containers)
+    return creds
 
 
 # ─── Phase Scan ───────────────────────────────────────────────────────────────
 
-def phase_scan(state: State) -> list:
-    titre("3", "9", "Scan des containers LXC")
+def phase_scan(state: State, containers: list = None) -> list:
+    if containers is None:
+        containers = scanner_containers()
 
-    containers = scanner_containers()
+    titre("3", "9", "Scan des containers LXC")
 
     for c in containers:
         services_str = ", ".join(c.services) if c.services else "aucun"
@@ -240,14 +337,16 @@ def generer_tfvars(containers: list, credentials: dict) -> dict:
 
     instances_hcl = ""
     for c in containers:
-        flavor = cfg_flavors.get(c.name, cfg_flavors.get("default", "m1.small"))
-        instances_hcl += f'  {c.name} = {{ flavor = "{flavor}" }}\n'
+        flavor       = cfg_flavors.get(c.name, cfg_flavors.get("default", "m1.small"))
+        service_type = _detect_service_type(c)
+        instances_hcl += f'  {c.name} = {{ flavor = "{flavor}", service_type = "{service_type}" }}\n'
 
     tfvars = f"""image_name          = "{CONFIG['image']['name']}"
 ssh_public_key      = "{ssh_pub_key}"
 external_network_id = "{CONFIG['network']['external_network_id']}"
 apache_floating_ip  = "{CONFIG['network']['apache_floating_ip']}"
 private_subnet_cidr = "{CONFIG['network'].get('private_subnet_cidr', '10.10.0.0/24')}"
+gateway_instance    = "{credentials['gateway']}"
 
 instances = {{
 {instances_hcl}}}
@@ -293,7 +392,8 @@ def phase_provisioning(state: State, credentials: dict, containers: list):
             nom,
             lxc_ip=c.ip if c else "",
             internal_ip=data["ip"],
-            floating_ip=data["floating_ip"]
+            floating_ip=data["floating_ip"],
+            service_type=_detect_service_type(c) if c else ""
         )
         fip = data["floating_ip"]
         display = f"{data['ip']} (FIP: {fip})" if fip != data["ip"] else data["ip"]
@@ -305,19 +405,20 @@ def phase_provisioning(state: State, credentials: dict, containers: list):
         tfvars_path.unlink()
         info("  terraform.tfvars supprime (securite)")
 
+    gateway           = credentials["gateway"]
     apache_fip        = CONFIG["network"].get("apache_floating_ip", "")
-    apache_connect_ip = apache_fip if apache_fip else instances.get("apache", {}).get("ip", "")
+    apache_connect_ip = apache_fip if apache_fip else instances.get(gateway, {}).get("ip", "")
 
     info("")
-    info("Attente SSH sur Apache (porte d'entree)...")
+    info(f"Attente SSH sur {gateway} (porte d'entree)...")
     if not attendre_ssh(apache_connect_ip, timeout=300):
-        fail(f"SSH apache ({apache_connect_ip})")
-        raise Exception(f"SSH timeout sur apache ({apache_connect_ip})")
-    ok(f"SSH apache ({apache_connect_ip})")
+        fail(f"SSH {gateway} ({apache_connect_ip})")
+        raise Exception(f"SSH timeout sur {gateway} ({apache_connect_ip})")
+    ok(f"SSH {gateway} ({apache_connect_ip})")
 
     info("Attente SSH sur les autres instances (via ProxyJump)...")
     for nom, data in instances.items():
-        if nom == "apache":
+        if nom == gateway:
             continue
         ip    = data["ip"]
         proxy = apache_connect_ip if apache_fip else None
@@ -481,6 +582,9 @@ def generer_provision_yml(containers: list):
                 "    - name: Enregistrement du device Cinder",
                 "      set_fact:",
                 "        cinder_dev: \"{{ cinder_device_raw.stdout | trim }}\"",
+                "    - name: Volume Cinder detecte",
+                "      debug:",
+                "        msg: \"Volume Cinder trouve : {{ cinder_dev }}\"",
                 "    - name: Formatage du volume Cinder (si non formate)",
                 "      filesystem:",
                 "        fstype: ext4",
@@ -533,6 +637,13 @@ def generer_provision_yml(containers: list):
 # ─── Helpers restore ──────────────────────────────────────────────────────────
 
 def _restore_mariadb_play(c, apache_containers, backup_containers):
+    if c.databases:
+        priv_all    = "/".join(f"{db.name}.*:ALL"    for db in c.databases)
+        priv_select = "/".join(f"{db.name}.*:SELECT" for db in c.databases)
+    else:
+        priv_all    = "*.*:ALL"
+        priv_select = "*.*:SELECT"
+
     lines = [
         "",
         f"- name: Restauration {c.name}",
@@ -559,6 +670,7 @@ def _restore_mariadb_play(c, apache_containers, backup_containers):
         '        host: "{{ old_apache_ip }}"',
         "        state: absent",
         "        login_unix_socket: /var/run/mysqld/mysqld.sock",
+        "      when: old_apache_ip != ''",
     ]
 
     for ac in apache_containers:
@@ -569,7 +681,7 @@ def _restore_mariadb_play(c, apache_containers, backup_containers):
             "        name: appuser",
             f'        host: "{_new_ip(ac.name)}"',
             '        password: "{{ mariadb_appuser_password }}"',
-            '        priv: "app_db.*:ALL/sysmonitor.*:ALL"',
+            f'        priv: "{priv_all}"',
             "        state: present",
             "        login_unix_socket: /var/run/mysqld/mysqld.sock",
         ]
@@ -582,7 +694,7 @@ def _restore_mariadb_play(c, apache_containers, backup_containers):
             "        name: appuser",
             f'        host: "{_new_ip(bc.name)}"',
             '        password: "{{ mariadb_appuser_password }}"',
-            '        priv: "app_db.*:SELECT"',
+            f'        priv: "{priv_select}"',
             "        state: present",
             "        login_unix_socket: /var/run/mysqld/mysqld.sock",
         ]
@@ -609,7 +721,7 @@ def _restore_mariadb_play(c, apache_containers, backup_containers):
 
 
 def _restore_apache_play(c, containers, nfs_containers):
-    nfs_ip = _new_ip(nfs_containers[0].name) if nfs_containers else "{{ new_ips.nfs }}"
+    nfs_html_c, nfs_html_path = _trouver_nfs(nfs_containers, "html")
     lines = [
         "",
         f"- name: Restauration {c.name}",
@@ -626,41 +738,80 @@ def _restore_apache_play(c, containers, nfs_containers):
         f'        src: "{{{{ staging_dir }}}}/{c.name}_apache2.tar.gz"',
         "        dest: /etc/",
         "        remote_src: yes",
-        "",
-        "    - name: Creation du point de montage web",
-        "      file:",
-        "        path: /var/www/html",
-        "        state: directory",
-        "        mode: '0755'",
-        "",
-        "    - name: Montage persistant du code web depuis NFS",
-        "      mount:",
-        f'        src: "{nfs_ip}:/srv/nfs/shared/html"',
-        "        path: /var/www/html",
-        "        fstype: nfs",
-        "        opts: defaults,_netdev",
-        "        state: mounted",
+        "    - name: Remise a zero ports.conf (evite Listen IP-specifique de l'ancien LXC)",
+        "      copy:",
+        "        dest: /etc/apache2/ports.conf",
+        "        content: |",
+        "          Listen 80",
+        "          <IfModule ssl_module>",
+        "              Listen 443",
+        "          </IfModule>",
+        "          <IfModule mod_gnutls.c>",
+        "              Listen 443",
+        "          </IfModule>",
+        "    - name: Correction MPM (evite conflit mpm_event + mpm_prefork apres restauration)",
+        "      shell: |",
+        "        a2dismod mpm_event mpm_worker 2>/dev/null || true",
+        "        a2enmod mpm_prefork",
+        "      changed_when: false",
+        "    - name: Activation module rewrite",
+        "      command: a2enmod rewrite",
+        "      changed_when: false",
+        "    - name: Verification syntaxe Apache avant redemarrage",
+        "      command: apache2ctl -t",
+        "      changed_when: false",
+        "      register: apache_configtest",
+        "      failed_when: apache_configtest.rc != 0",
     ]
-
-    for other in containers:
-        escaped_ip = other.ip.replace(".", "\\.")
+    if nfs_html_c:
         lines += [
             "",
-            f"    - name: Remplacement IP {other.name} dans config.php",
-            "      replace:",
-            "        path: /var/www/html/config.php",
-            f"        regexp: '\\b{escaped_ip}\\b'",
-            f'        replace: "{_new_ip(other.name)}"',
+            "    - name: Creation du point de montage web",
+            "      file:",
+            "        path: /var/www/html",
+            "        state: directory",
+            "        mode: '0755'",
+            "",
+            "    - name: Montage persistant du code web depuis NFS",
+            "      mount:",
+            f'        src: "{_new_ip(nfs_html_c.name)}:{nfs_html_path}"',
+            "        path: /var/www/html",
+            "        fstype: nfs",
+            "        opts: defaults,_netdev",
+            "        state: mounted",
+        ]
+    else:
+        lines += [
+            "",
+            "    - name: Decompression archive HTML (pas de NFS detecte)",
+            "      unarchive:",
+            f'        src: "{{{{ staging_dir }}}}/{c.name}_html.tar.gz"',
+            "        dest: /var/www/",
+            "        remote_src: yes",
         ]
 
-    lines += [
-        "",
-        "    - name: Remplacement DB_PASS dans config.php",
-        "      lineinfile:",
-        "        path: /var/www/html/config.php",
-        "        regexp: \"define\\\\('DB_PASS'\"",
-        "        line: \"define('DB_PASS', '{{ mariadb_appuser_password }}');\"",
-    ]
+    config_php = c.apache_config.config_php_path if c.apache_config else None
+
+    if config_php:
+        for other in containers:
+            escaped_ip = other.ip.replace(".", "\\.")
+            lines += [
+                "",
+                f"    - name: Remplacement IP {other.name} dans config.php",
+                "      replace:",
+                f"        path: {config_php}",
+                f"        regexp: '\\b{escaped_ip}\\b'",
+                f'        replace: "{_new_ip(other.name)}"',
+            ]
+
+        lines += [
+            "",
+            "    - name: Remplacement DB_PASS dans config.php",
+            "      lineinfile:",
+            f"        path: {config_php}",
+            "        regexp: \"define\\\\('DB_PASS'\"",
+            "        line: \"define('DB_PASS', '{{ mariadb_appuser_password }}');\"",
+        ]
 
     lines += [
         "",
@@ -680,7 +831,16 @@ def _restore_apache_play(c, containers, nfs_containers):
 
 
 def _restore_nfs_play(c):
-    return [
+    cidr = CONFIG['network'].get('private_subnet_cidr', '10.10.0.0/24')
+    nfs_parent, _ = _nfs_archive_root(c)
+
+    ftp_export_path = next(
+        (e.path for e in c.nfs_exports
+         if "ftp" in e.path.lower() or "upload" in e.path.lower()),
+        None
+    )
+
+    lines = [
         "",
         f"- name: Restauration {c.name}",
         f"  hosts: {c.name}",
@@ -692,35 +852,43 @@ def _restore_nfs_play(c):
         "        state: directory",
         "        mode: '0700'",
         "",
-        "    - name: Creation structure NFS",
+        "    - name: Creation repertoire NFS parent",
         "      file:",
-        '        path: "{{ item }}"',
+        f"        path: {nfs_parent}",
         "        state: directory",
         "        mode: '0755'",
-        "      loop:",
-        "        - /srv/nfs/shared",
-        "        - /srv/nfs/shared/html",
-        "        - /srv/nfs/shared/ftp_uploads",
-        "        - /srv/nfs/shared/documents",
-        "        - /srv/nfs/shared/scripts",
-        "",
-        "    - name: Permissions ouvertes pour le partage FTP",
-        "      file:",
-        "        path: /srv/nfs/shared/ftp_uploads",
-        "        state: directory",
-        "        mode: '0777'",
         "",
         "    - name: Decompression archive NFS",
         "      unarchive:",
         f'        src: "{{{{ staging_dir }}}}/{c.name}_nfs_shared.tar.gz"',
-        "        dest: /srv/nfs/",
+        f"        dest: {nfs_parent}/",
         "        remote_src: yes",
+    ]
+
+    if ftp_export_path:
+        lines += [
+            "",
+            "    - name: Permissions ouvertes pour le partage FTP",
+            "      file:",
+            f"        path: {ftp_export_path}",
+            "        state: directory",
+            "        mode: '0777'",
+        ]
+
+    lines += [
         "",
         "    - name: Reecriture /etc/exports avec nouveau sous-reseau",
         "      copy:",
         "        content: |",
-        f"          /srv/nfs/shared {CONFIG['network'].get('private_subnet_cidr', '10.10.0.0/24')}(rw,sync,no_subtree_check,no_root_squash)",
-        f"          /srv/nfs/shared/ftp_uploads {CONFIG['network'].get('private_subnet_cidr', '10.10.0.0/24')}(rw,sync,no_subtree_check,no_root_squash)",
+    ]
+    if c.nfs_exports:
+        for e in c.nfs_exports:
+            lines.append(f"          {e.path} {cidr}({e.options})")
+    else:
+        lines.append(f"          /srv/nfs/shared {cidr}(rw,sync,no_subtree_check,no_root_squash)")
+        lines.append(f"          /srv/nfs/shared/ftp_uploads {cidr}(rw,sync,no_subtree_check,no_root_squash)")
+
+    lines += [
         "        dest: /etc/exports",
         "",
         "    - name: Activation des exports NFS",
@@ -731,10 +899,12 @@ def _restore_nfs_play(c):
         "        name: nfs-kernel-server",
         "        state: restarted",
     ]
+    return lines
 
 
 def _restore_backup_play(c, mariadb_containers):
-    mariadb_ip = _new_ip(mariadb_containers[0].name) if mariadb_containers else "{{ new_ips.mariadb }}"
+    mariadb_c  = _mariadb_pour_backup(c, mariadb_containers)
+    mariadb_ip = _new_ip(mariadb_c.name) if mariadb_c else ""
     db_name = c.backup_config.database if c.backup_config and c.backup_config.database else "app_db"
     dest_dir = c.backup_config.destination if c.backup_config and c.backup_config.destination else "/backups"
     return [
@@ -788,8 +958,10 @@ def _restore_backup_play(c, mariadb_containers):
 
 
 def _restore_ftp_play(c, nfs_containers):
-    nfs_ip = _new_ip(nfs_containers[0].name) if nfs_containers else "{{ new_ips.nfs }}"
-    return [
+    nfs_ftp_c, nfs_ftp_path = _trouver_nfs(nfs_containers, "ftp")
+    if nfs_ftp_c is None:
+        nfs_ftp_c, nfs_ftp_path = _trouver_nfs(nfs_containers, "upload")
+    lines = [
         "",
         f"- name: Restauration {c.name}",
         f"  hosts: {c.name}",
@@ -818,15 +990,20 @@ def _restore_ftp_play(c, nfs_containers):
         '        owner: "{{ item.username }}"',
         "        mode: '0755'",
         '      loop: "{{ ftp_users }}"',
-        "",
-        "    - name: Montage persistant du partage FTP depuis NFS",
-        "      mount:",
-        f'        src: "{nfs_ip}:/srv/nfs/shared/ftp_uploads"',
-        '        path: "{{ item.home }}/files"',
-        "        fstype: nfs",
-        "        opts: defaults,_netdev",
-        "        state: mounted",
-        '      loop: "{{ ftp_users }}"',
+    ]
+    if nfs_ftp_c:
+        lines += [
+            "",
+            "    - name: Montage persistant du partage FTP depuis NFS",
+            "      mount:",
+            f'        src: "{_new_ip(nfs_ftp_c.name)}:{nfs_ftp_path}"',
+            '        path: "{{ item.home }}/files"',
+            "        fstype: nfs",
+            "        opts: defaults,_netdev",
+            "        state: mounted",
+            '      loop: "{{ ftp_users }}"',
+        ]
+    lines += [
         "",
         "    - name: Configuration vsftpd",
         "      copy:",
@@ -858,6 +1035,7 @@ def _restore_ftp_play(c, nfs_containers):
         "        name: vsftpd",
         "        state: restarted",
     ]
+    return lines
 
 
 def generer_restore_yml(containers: list, ip_mapping: dict):
@@ -917,6 +1095,16 @@ def _validate_mariadb_play(c):
         "        that: ansible_facts.services['mariadb.service'].state == 'running'",
         "        fail_msg: \"MariaDB n'est pas actif\"",
         "",
+        "    - name: Verification montage volume Cinder sur /var/lib/mysql",
+        "      shell: mount | grep ' /var/lib/mysql '",
+        "      register: cinder_mount_check",
+        "      changed_when: false",
+        "",
+        "    - name: Volume Cinder monte sur /var/lib/mysql",
+        "      assert:",
+        "        that: cinder_mount_check.rc == 0",
+        "        fail_msg: \"Le volume Cinder n'est pas monte sur /var/lib/mysql\"",
+        "",
         "    - name: Verification bases de données",
         "      community.mysql.mysql_query:",
         "        query: \"SHOW DATABASES LIKE '{{ item }}'\"",
@@ -943,8 +1131,12 @@ def _validate_mariadb_play(c):
     ]
 
 
-def _validate_apache_play(c, containers):
-    return [
+def _validate_apache_play(c, containers, nfs_containers):
+    config_php = c.apache_config.config_php_path if c.apache_config else None
+    old_ips = c.apache_config.ips_trouvees if c.apache_config else []
+    nfs_html_c, _ = _trouver_nfs(nfs_containers, "html")
+
+    lines = [
         "",
         f"- name: Validation {c.name}",
         f"  hosts: {c.name}",
@@ -964,16 +1156,33 @@ def _validate_apache_play(c, containers):
         "        method: GET",
         "        status_code: 200",
         "      register: http_check",
-        "",
-        "    - name: Verification montage NFS du code web",
-        "      shell: mount | grep ' /var/www/html ' | grep nfs",
-        "      register: apache_mount",
-        "      changed_when: false",
-        "",
-        "    - name: Verification absence anciennes IPs LXC",
-        '      shell: grep -rE "10\\.0\\." /var/www/html/config.php || echo "OK"',
-        "      register: ip_check",
-        "      changed_when: false",
+    ]
+
+    if nfs_html_c:
+        lines += [
+            "",
+            "    - name: Verification montage NFS du code web",
+            "      shell: mount | grep ' /var/www/html ' | grep nfs",
+            "      register: apache_mount",
+            "      changed_when: false",
+        ]
+
+    if config_php and old_ips:
+        for old_ip in old_ips:
+            lines += [
+                "",
+                f"    - name: Verification absence ancienne IP {old_ip} dans config.php",
+                f'      shell: grep -qF "{old_ip}" {config_php} && echo "FOUND" || echo "OK"',
+                f"      register: ip_check_{old_ip.replace('.', '_')}",
+                "      changed_when: false",
+                "",
+                f"    - name: Ancienne IP {old_ip} absente de config.php",
+                "      assert:",
+                f"        that: ip_check_{old_ip.replace('.', '_')}.stdout == 'OK'",
+                f"        fail_msg: \"Ancienne IP {old_ip} encore presente dans {config_php}\"",
+            ]
+
+    lines += [
         "",
         "    - name: Creation repertoire rapport",
         "      file:",
@@ -986,9 +1195,19 @@ def _validate_apache_play(c, containers):
         "        content: \"{{ {'service': '" + c.name + "', 'status': 'ok', 'http_code': http_check.status} | to_json }}\"",
         "        dest: /tmp/migration/validation_apache.json",
     ]
+    return lines
 
 
 def _validate_nfs_play(c):
+    nfs_root = c.nfs_exports[0].path if c.nfs_exports else "/srv/nfs/shared"
+    html_path = next(
+        (e.path for e in c.nfs_exports if "html" in e.path),
+        f"{nfs_root}/html"
+    )
+    ftp_path = next(
+        (e.path for e in c.nfs_exports if "ftp" in e.path.lower() or "upload" in e.path.lower()),
+        f"{nfs_root}/ftp_uploads"
+    )
     return [
         "",
         f"- name: Validation {c.name}",
@@ -1007,13 +1226,13 @@ def _validate_nfs_play(c):
         "",
         "    - name: Verification fichiers partages",
         "      find:",
-        "        paths: /srv/nfs/shared",
+        f"        paths: {nfs_root}",
         "        recurse: yes",
         "      register: nfs_files",
         "",
         "    - name: Verification presence du code web partage",
         "      stat:",
-        "        path: /srv/nfs/shared/html/index.php",
+        f"        path: {html_path}/index.php",
         "      register: nfs_web",
         "",
         "    - name: Code web partage present",
@@ -1023,7 +1242,7 @@ def _validate_nfs_play(c):
         "",
         "    - name: Verification presence du partage FTP",
         "      stat:",
-        "        path: /srv/nfs/shared/ftp_uploads",
+        f"        path: {ftp_path}",
         "      register: nfs_ftp",
         "",
         "    - name: Partage FTP present sur NFS",
@@ -1045,9 +1264,10 @@ def _validate_nfs_play(c):
 
 
 def _validate_backup_play(c, mariadb_containers):
-    mariadb_ip = _new_ip(mariadb_containers[0].name) if mariadb_containers else "{{ new_ips.mariadb }}"
+    mariadb_c  = _mariadb_pour_backup(c, mariadb_containers)
+    mariadb_ip = _new_ip(mariadb_c.name) if mariadb_c else ""
     db_name = c.backup_config.database if c.backup_config and c.backup_config.database else "app_db"
-    return [
+    lines = [
         "",
         f"- name: Validation {c.name}",
         f"  hosts: {c.name}",
@@ -1062,15 +1282,20 @@ def _validate_backup_play(c, mariadb_containers):
         "      assert:",
         "        that: backup_script.stat.exists",
         "        fail_msg: \"backup.sh est absent\"",
-        "",
-        "    - name: Verification nouvelle IP mariadb dans backup.sh",
-        f'      shell: grep "{mariadb_ip}" /usr/local/bin/backup.sh',
-        "      register: ip_in_backup",
-        "",
-        "    - name: Nouvelle IP mariadb presente dans backup.sh",
-        "      assert:",
-        "        that: ip_in_backup.rc == 0",
-        "        fail_msg: \"La nouvelle IP mariadb est absente de backup.sh\"",
+    ]
+    if mariadb_ip:
+        lines += [
+            "",
+            "    - name: Verification nouvelle IP mariadb dans backup.sh",
+            f'      shell: grep "{mariadb_ip}" /usr/local/bin/backup.sh',
+            "      register: ip_in_backup",
+            "",
+            "    - name: Nouvelle IP mariadb presente dans backup.sh",
+            "      assert:",
+            "        that: ip_in_backup.rc == 0",
+            "        fail_msg: \"La nouvelle IP mariadb est absente de backup.sh\"",
+        ]
+    lines += [
         "",
         "    - name: Verification options mysqldump sans lock",
         "      shell: grep -- '--single-transaction --skip-lock-tables' /usr/local/bin/backup.sh",
@@ -1109,10 +1334,15 @@ def _validate_backup_play(c, mariadb_containers):
         "        content: \"{{ {'service': '" + c.name + "', 'status': 'ok', 'script': backup_script.stat.exists} | to_json }}\"",
         "        dest: /tmp/migration/validation_backup.json",
     ]
+    return lines
 
 
-def _validate_ftp_play(c):
-    return [
+def _validate_ftp_play(c, nfs_containers):
+    nfs_ftp_c, _ = _trouver_nfs(nfs_containers, "ftp")
+    if nfs_ftp_c is None:
+        nfs_ftp_c, _ = _trouver_nfs(nfs_containers, "upload")
+
+    lines = [
         "",
         f"- name: Validation {c.name}",
         f"  hosts: {c.name}",
@@ -1131,12 +1361,19 @@ def _validate_ftp_play(c):
         '        path: "{{ item.home }}/files"',
         '      loop: "{{ ftp_users }}"',
         "      register: ftp_dirs",
-        "",
-        "    - name: Verification montage NFS sur files",
-        "      shell: mount | grep ' {{ item.home }}/files ' | grep nfs",
-        '      loop: "{{ ftp_users }}"',
-        "      register: ftp_mounts",
-        "      changed_when: false",
+    ]
+
+    if nfs_ftp_c:
+        lines += [
+            "",
+            "    - name: Verification montage NFS sur files",
+            "      shell: mount | grep ' {{ item.home }}/files ' | grep nfs",
+            '      loop: "{{ ftp_users }}"',
+            "      register: ftp_mounts",
+            "      changed_when: false",
+        ]
+
+    lines += [
         "",
         "    - name: Verification password hash non vide pour chaque user FTP",
         "      shell: \"grep '^{{ item.username }}:' /etc/shadow | cut -d: -f2 | grep -q '^[$]'\"",
@@ -1164,11 +1401,13 @@ def _validate_ftp_play(c):
         "        content: \"{{ {'service': '" + c.name + "', 'status': 'ok'} | to_json }}\"",
         "        dest: /tmp/migration/validation_ftp.json",
     ]
+    return lines
 
 
 def generer_validate_yml(containers: list, ip_mapping: dict):
     """Generate validate.yml dynamically based on scanned container services."""
     mariadb_containers = [c for c in containers if "mariadb" in c.services]
+    nfs_containers     = [c for c in containers if "nfs-server" in c.services]
 
     lines = ["---", "# Généré automatiquement par l'orchestrateur"]
 
@@ -1176,19 +1415,19 @@ def generer_validate_yml(containers: list, ip_mapping: dict):
         if "mariadb"    in c.services:
             lines += _validate_mariadb_play(c)
         if "apache2"    in c.services:
-            lines += _validate_apache_play(c, containers)
+            lines += _validate_apache_play(c, containers, nfs_containers)
         if "nfs-server" in c.services:
             lines += _validate_nfs_play(c)
         if c.backup_config is not None and "mariadb" not in c.services:
             lines += _validate_backup_play(c, mariadb_containers)
         if "vsftpd"     in c.services:
-            lines += _validate_ftp_play(c)
+            lines += _validate_ftp_play(c, nfs_containers)
 
     (ANSIBLE_DIR / "validate.yml").write_text("\n".join(lines) + "\n")
     ok("validate.yml")
 
 
-def generer_inventaire(instances: dict, containers: list):
+def generer_inventaire(instances: dict, containers: list, gateway: str):
     titre("5", "9", "Generation inventaire Ansible")
 
     apache_fip = CONFIG["network"].get("apache_floating_ip", "")
@@ -1199,7 +1438,7 @@ def generer_inventaire(instances: dict, containers: list):
             ["ssh-keygen", "-R", apache_fip],
             capture_output=True
         )
-        apache_internal = instances.get("apache", {}).get("ip", "")
+        apache_internal = instances.get(gateway, {}).get("ip", "")
         if apache_internal:
             subprocess.run(
                 ["ssh-keygen", "-R", apache_internal],
@@ -1207,14 +1446,16 @@ def generer_inventaire(instances: dict, containers: list):
             )
     inventory  = ""
     for nom, data in instances.items():
-        if nom == "apache" and apache_fip:
+        if nom == gateway and apache_fip:
             host_ip = apache_fip
             extra   = ""
         else:
             host_ip     = data["ip"]
+            # %p n'est pas substitué par Ansible quand les guillemets sont imbriqués
+            # → port 65535 (sentinel OpenSSH) → timeout. On fixe le port à 22.
             proxy_args  = (
                 f'-o StrictHostKeyChecking=no '
-                f'-o ProxyCommand="ssh -i {SSH_KEY} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -W %h:%p {ssh_user}@{apache_fip}"'
+                f'-o ProxyCommand="ssh -i {SSH_KEY} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -W %h:22 {ssh_user}@{apache_fip}"'
             )
             extra       = f" ansible_ssh_common_args='{proxy_args}'"
         inventory += f"[{nom}]\n"
@@ -1240,12 +1481,11 @@ def generer_inventaire(instances: dict, containers: list):
             "instance_ip":   data["ip"],
         }
 
-        if c.databases:
-            host_vars["databases"] = [d.name for d in c.databases]
-        if c.db_users:
-            host_vars["old_apache_ip"] = next(
-                (u.host for u in c.db_users if u.host != "%"), ""
-            )
+        host_vars["databases"] = [d.name for d in c.databases]
+        host_vars["old_apache_ip"] = (
+            next((u.host for u in c.db_users if u.host != "%"), "")
+            if c.db_users else ""
+        )
         if c.ftp_users:
             host_vars["ftp_users"] = [
                 {"username": u.username, "home": u.home, "password_hash": u.password_hash}
@@ -1259,7 +1499,7 @@ def generer_inventaire(instances: dict, containers: list):
                 for e in c.nfs_exports
             ]
 
-        hv_ip   = data["floating_ip"] if nom == "apache" and apache_fip else data["ip"]
+        hv_ip   = data["floating_ip"] if nom == gateway and apache_fip else data["ip"]
         hv_path = hv_dir / f"{hv_ip}.yml"
         hv_path.write_text(
             "---\n" + "\n".join(f"{k}: {json.dumps(v)}" for k, v in host_vars.items())
@@ -1286,7 +1526,8 @@ def phase_backup(containers: list, credentials: dict):
         info(f"Backup {c.name}...")
 
         if "mariadb" in c.services:
-            cnf = f"[mysqldump]\nuser=root\npassword={credentials['mariadb_root_password']}\n"
+            root_pwd = credentials["mariadb_root_passwords"].get(c.name, "")
+            cnf = f"[mysqldump]\nuser=root\npassword={root_pwd}\n"
             subprocess.run(
                 ["sudo", "lxc-attach", "-n", c.name, "--", "tee", "/tmp/.my.cnf"],
                 input=cnf, capture_output=True, text=True
@@ -1347,21 +1588,22 @@ def phase_backup(containers: list, credentials: dict):
                     ok(f"archive ftp {username}")
 
         if "nfs-server" in c.services:
+            nfs_parent, nfs_subdir = _nfs_archive_root(c)
             r = executer_cmd([
                 "sudo", "tar", "-czf",
                 os.path.join(tmp_dir, f"{c.name}_nfs_shared.tar.gz"),
-                "-C", f"/var/lib/lxc/{c.name}/rootfs/srv/nfs",
-                "shared"
+                "-C", f"/var/lib/lxc/{c.name}/rootfs{nfs_parent}",
+                nfs_subdir
             ])
             if r.returncode == 0:
-                ok("archive /srv/nfs/shared")
+                ok(f"archive {nfs_parent}/{nfs_subdir}")
 
     return tmp_dir
 
 
 # ─── Phase Transfert ──────────────────────────────────────────────────────────
 
-def phase_transfert(instances: dict, tmp_dir: str, containers: list, state: State):
+def phase_transfert(instances: dict, tmp_dir: str, containers: list, state: State, gateway: str):
     titre("7", "9", "Transfert des archives")
 
     apache_fip    = CONFIG["network"].get("apache_floating_ip", "")
@@ -1386,8 +1628,8 @@ def phase_transfert(instances: dict, tmp_dir: str, containers: list, state: Stat
         if not fichiers:
             continue
 
-        connect_ip = data["floating_ip"] if nom == "apache" else data["ip"]
-        use_proxy  = bool(apache_fip) and nom != "apache"
+        connect_ip = data["floating_ip"] if nom == gateway else data["ip"]
+        use_proxy  = bool(apache_fip) and nom != gateway
 
         info(f"Transfert vers {nom} ({connect_ip})...")
 
@@ -1504,33 +1746,37 @@ def phase_ansible(state: State, phase: Phase, etape_num: str,
 
 def rollback(state: State, erreur: str):
     print(f"\n  ERREUR : {erreur}")
-    print("  Rollback en cours...")
+    print("  Rollback en cours (peut prendre 3-5 min sur CERIST)...\n")
 
-    # Détruire uniquement les instances et volumes — pas le réseau.
-    # Le réseau (router/subnet) est lent à recréer sur CERIST, on le conserve
-    # entre les runs pour éviter le timeout sur router_interface.
+    # Détruire instances + volume. Le réseau (router/subnet) est conservé :
+    # il est lent à recréer sur CERIST et ne bloque pas un re-run propre.
+    instances_provisionnees = list(state.ip_mapping.keys())
+
     cibles = [
         "openstack_compute_floatingip_associate_v2.apache_fip",
-        "openstack_compute_volume_attach_v2.mariadb_volume_attach",
-        'openstack_compute_instance_v2.instances["apache"]',
-        'openstack_compute_instance_v2.instances["backup"]',
-        'openstack_compute_instance_v2.instances["ftp"]',
-        'openstack_compute_instance_v2.instances["mariadb"]',
-        'openstack_compute_instance_v2.instances["nfs"]',
     ]
+    for nom in instances_provisionnees:
+        stype = state.ip_mapping.get(nom, {}).get("service_type", "")
+        if stype == "mariadb":
+            cibles.append(f'openstack_compute_volume_attach_v2.mariadb_volume_attach["{nom}"]')
+            cibles.append(f'openstack_blockstorage_volume_v3.mariadb_volume["{nom}"]')
+        cibles.append(f'openstack_compute_instance_v2.instances["{nom}"]')
     target_args = []
     for t in cibles:
         target_args += ["-target", t]
 
-    r = executer_cmd(
+    # stdout/stderr non capturés : terraform s'affiche en temps réel
+    # (timeout 15 min — le détachement Cinder sur CERIST est lent)
+    r = subprocess.run(
         ["terraform", "destroy", "-auto-approve", "-no-color"] + target_args,
         cwd=TERRAFORM_DIR,
-        env=_terraform_env()
+        env=_terraform_env(),
+        timeout=900,
     )
     if r.returncode == 0:
         ok("Instances OpenStack supprimees")
     else:
-        fail("terraform destroy (instances)")
+        fail("terraform destroy (instances) — relance cleanup.sh si des ressources restent")
 
     state.marquer_echec(erreur)
 
@@ -1539,7 +1785,7 @@ def rollback(state: State, erreur: str):
 
 
 
-def generer_rapport(state: State, instances: dict):
+def generer_rapport(state: State, instances: dict, gateway: str):
     titre("9", "9", "Rapport final")
 
     rapport = {
@@ -1564,7 +1810,7 @@ def generer_rapport(state: State, instances: dict):
     rapport_path = BASE_DIR / "migration_report.json"
     rapport_path.write_text(json.dumps(rapport, indent=2))
     print(f"\n  Rapport ecrit : {rapport_path}")
-    apache_data = instances.get("apache", {})
+    apache_data = instances.get(gateway, {})
     apache_ip   = apache_data.get("floating_ip") or apache_data.get("ip", "")
     if apache_ip:
         configurer_iptables(apache_ip)
@@ -1582,17 +1828,22 @@ def main():
 
     try:
         verifier_prerequis()
-        configurer_iptables(_get_lxc_apache_ip())
-        credentials = collecter_credentials()
+
+        # Scan silencieux avant les credentials pour conditionner les questions
+        containers_pre = scanner_containers()
+        credentials = collecter_credentials(containers_pre)
+        gateway = credentials["gateway"]
+
+        configurer_iptables(_get_lxc_apache_ip(gateway))
 
         if state.phase.value <= Phase.SCAN.value:
-            containers = phase_scan(state)
+            containers = phase_scan(state, containers_pre)
         else:
-            containers = scanner_containers()
+            containers = containers_pre
 
         if state.phase.value <= Phase.PROVISIONING.value:
             instances = phase_provisioning(state, credentials, containers)
-            generer_inventaire(instances, containers)
+            generer_inventaire(instances, containers, gateway)
         else:
             r = executer_cmd(["terraform", "output", "-json"], cwd=TERRAFORM_DIR)
             outputs = json.loads(r.stdout) if r.returncode == 0 and r.stdout.strip() else {}
@@ -1606,7 +1857,7 @@ def main():
 
         if state.phase.value <= Phase.BACKUP.value:
             tmp_dir = phase_backup(containers, credentials)
-            phase_transfert(instances, tmp_dir, containers, state)
+            phase_transfert(instances, tmp_dir, containers, state, gateway)
 
         if state.phase.value <= Phase.PROVISION.value:
             phase_ansible(state, Phase.PROVISION, "8a", "Provisionnement logiciel", "provision.yml")
@@ -1621,7 +1872,7 @@ def main():
             phase_ansible(state, Phase.VALIDATE, "8c", "Validation interne", "validate.yml")
 
         state.marquer_termine()
-        generer_rapport(state, instances)
+        generer_rapport(state, instances, gateway)
 
     except Exception as e:
         rollback(state, str(e))
@@ -1635,9 +1886,10 @@ def regenerer_inventaire():
         print("Erreur : terraform output a échoué")
         sys.exit(1)
     outputs = json.loads(r.stdout)
+    containers = scanner_containers()
+    gateway = _detecter_gateway(containers)
     if "instances" not in outputs:
         print("  Pas de state Terraform. Régénération des playbooks uniquement.")
-        containers = scanner_containers()
         generer_provision_yml(containers)
         ip_mapping = {}
         generer_restore_yml(containers, ip_mapping)
@@ -1645,8 +1897,7 @@ def regenerer_inventaire():
         print("Playbooks régénérés.")
         return
     instances = outputs["instances"]["value"]
-    containers = scanner_containers()
-    generer_inventaire(instances, containers)
+    generer_inventaire(instances, containers, gateway)
     print("Inventaire régénéré.")
 
 

@@ -20,15 +20,55 @@
         status_code: 200
       register: http_check
 
-    - name: Verification montage NFS du code web
-      shell: mount | grep ' /var/www/html ' | grep nfs
-      register: apache_mount
+    - name: Verification absence ancienne IP 10.0.3.10 dans config.php
+      shell: grep -qF "10.0.3.10" /var/www/html/config.php && echo "FOUND" || echo "OK"
+      register: ip_check_10_0_3_10
       changed_when: false
 
-    - name: Verification absence anciennes IPs LXC
-      shell: grep -rE "10\.0\." /var/www/html/config.php || echo "OK"
-      register: ip_check
+    - name: Ancienne IP 10.0.3.10 absente de config.php
+      assert:
+        that: ip_check_10_0_3_10.stdout == 'OK'
+        fail_msg: "Ancienne IP 10.0.3.10 encore presente dans /var/www/html/config.php"
+
+    - name: Verification absence ancienne IP 10.0.3.20 dans config.php
+      shell: grep -qF "10.0.3.20" /var/www/html/config.php && echo "FOUND" || echo "OK"
+      register: ip_check_10_0_3_20
       changed_when: false
+
+    - name: Ancienne IP 10.0.3.20 absente de config.php
+      assert:
+        that: ip_check_10_0_3_20.stdout == 'OK'
+        fail_msg: "Ancienne IP 10.0.3.20 encore presente dans /var/www/html/config.php"
+
+    - name: Verification absence ancienne IP 10.0.3.30 dans config.php
+      shell: grep -qF "10.0.3.30" /var/www/html/config.php && echo "FOUND" || echo "OK"
+      register: ip_check_10_0_3_30
+      changed_when: false
+
+    - name: Ancienne IP 10.0.3.30 absente de config.php
+      assert:
+        that: ip_check_10_0_3_30.stdout == 'OK'
+        fail_msg: "Ancienne IP 10.0.3.30 encore presente dans /var/www/html/config.php"
+
+    - name: Verification absence ancienne IP 10.0.3.40 dans config.php
+      shell: grep -qF "10.0.3.40" /var/www/html/config.php && echo "FOUND" || echo "OK"
+      register: ip_check_10_0_3_40
+      changed_when: false
+
+    - name: Ancienne IP 10.0.3.40 absente de config.php
+      assert:
+        that: ip_check_10_0_3_40.stdout == 'OK'
+        fail_msg: "Ancienne IP 10.0.3.40 encore presente dans /var/www/html/config.php"
+
+    - name: Verification absence ancienne IP 10.0.3.50 dans config.php
+      shell: grep -qF "10.0.3.50" /var/www/html/config.php && echo "FOUND" || echo "OK"
+      register: ip_check_10_0_3_50
+      changed_when: false
+
+    - name: Ancienne IP 10.0.3.50 absente de config.php
+      assert:
+        that: ip_check_10_0_3_50.stdout == 'OK'
+        fail_msg: "Ancienne IP 10.0.3.50 encore presente dans /var/www/html/config.php"
 
     - name: Creation repertoire rapport
       file:
@@ -101,6 +141,52 @@
         content: "{{ {'service': 'backup', 'status': 'ok', 'script': backup_script.stat.exists} | to_json }}"
         dest: /tmp/migration/validation_backup.json
 
+- name: Validation db1
+  hosts: db1
+  become: true
+  tasks:
+    - name: Verification service MariaDB
+      service_facts:
+
+    - name: MariaDB est actif
+      assert:
+        that: ansible_facts.services['mariadb.service'].state == 'running'
+        fail_msg: "MariaDB n'est pas actif"
+
+    - name: Verification montage volume Cinder sur /var/lib/mysql
+      shell: mount | grep ' /var/lib/mysql '
+      register: cinder_mount_check
+      changed_when: false
+
+    - name: Volume Cinder monte sur /var/lib/mysql
+      assert:
+        that: cinder_mount_check.rc == 0
+        fail_msg: "Le volume Cinder n'est pas monte sur /var/lib/mysql"
+
+    - name: Verification bases de données
+      community.mysql.mysql_query:
+        query: "SHOW DATABASES LIKE '{{ item }}'"
+        login_unix_socket: /var/run/mysqld/mysqld.sock
+      loop: "{{ databases }}"
+      register: db_check
+
+    - name: Verification user appuser
+      community.mysql.mysql_query:
+        query: "SELECT user, host FROM mysql.user WHERE user='appuser'"
+        login_unix_socket: /var/run/mysqld/mysqld.sock
+      register: user_check
+
+    - name: Creation repertoire rapport
+      file:
+        path: /tmp/migration
+        state: directory
+        mode: '0755'
+
+    - name: Ecriture rapport MariaDB
+      copy:
+        content: "{{ {'service': 'db1', 'status': 'ok', 'databases': databases} | to_json }}"
+        dest: /tmp/migration/validation_mariadb.json
+
 - name: Validation ftp
   hosts: ftp
   become: true
@@ -162,6 +248,16 @@
       assert:
         that: ansible_facts.services['mariadb.service'].state == 'running'
         fail_msg: "MariaDB n'est pas actif"
+
+    - name: Verification montage volume Cinder sur /var/lib/mysql
+      shell: mount | grep ' /var/lib/mysql '
+      register: cinder_mount_check
+      changed_when: false
+
+    - name: Volume Cinder monte sur /var/lib/mysql
+      assert:
+        that: cinder_mount_check.rc == 0
+        fail_msg: "Le volume Cinder n'est pas monte sur /var/lib/mysql"
 
     - name: Verification bases de données
       community.mysql.mysql_query:
@@ -237,3 +333,33 @@
       copy:
         content: "{{ {'service': 'nfs', 'status': 'ok', 'files_count': nfs_files.matched} | to_json }}"
         dest: /tmp/migration/validation_nfs.json
+
+- name: Validation web1
+  hosts: web1
+  become: true
+  tasks:
+    - name: Verification service Apache
+      service_facts:
+
+    - name: Apache est actif
+      assert:
+        that: ansible_facts.services['apache2.service'].state == 'running'
+        fail_msg: "Apache n'est pas actif"
+
+    - name: Test HTTP sur localhost
+      uri:
+        url: http://localhost
+        method: GET
+        status_code: 200
+      register: http_check
+
+    - name: Creation repertoire rapport
+      file:
+        path: /tmp/migration
+        state: directory
+        mode: '0755'
+
+    - name: Ecriture rapport Apache
+      copy:
+        content: "{{ {'service': 'web1', 'status': 'ok', 'http_code': http_check.status} | to_json }}"
+        dest: /tmp/migration/validation_apache.json

@@ -296,7 +296,12 @@ def lire_apache_config(nom: str) -> Optional[ApacheConfig]:
     ])
     if not sortie:
         return None
-    ips = re.findall(r'\b10\.0\.3\.\d{1,3}\b', sortie)
+    ips = re.findall(
+        r'\b(?:10\.\d{1,3}\.\d{1,3}\.\d{1,3}'
+        r'|172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}'
+        r'|192\.168\.\d{1,3}\.\d{1,3})\b',
+        sortie
+    )
     ips = list(dict.fromkeys(ips))
     return ApacheConfig(
         config_php_path = chemin,

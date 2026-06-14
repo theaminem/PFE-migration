@@ -61,9 +61,10 @@ resource "openstack_compute_keypair_v2" "migration_key" {
 }
 
 resource "openstack_blockstorage_volume_v3" "mariadb_volume" {
-  name        = "mariadb-data"
+  for_each    = local.mariadb_instances
+  name        = "mariadb-data-${each.key}"
   size        = 10
-  description = "Volume de données MariaDB"
+  description = "Volume de données MariaDB pour ${each.key}"
 }
 
 # ─── Security Groups ──────────────────────────────────────────────────────────
@@ -223,6 +224,8 @@ locals {
     ftp     = openstack_networking_secgroup_v2.sg_ftp.id
     nfs     = openstack_networking_secgroup_v2.sg_nfs.id
   }
+  mariadb_instances   = { for k, v in var.instances : k => v if v.service_type == "mariadb" }
+  apache_instance_key = var.gateway_instance
 }
 
 # ─── Instances Nova ───────────────────────────────────────────────────────────
@@ -233,7 +236,7 @@ resource "openstack_compute_instance_v2" "instances" {
   image_name      = var.image_name
   flavor_name     = each.value.flavor
   key_pair        = openstack_compute_keypair_v2.migration_key.name
-  security_groups = [local.secgroup_map[each.key]]
+  security_groups = [local.secgroup_map[each.value.service_type]]
 
   network {
     uuid = openstack_networking_network_v2.migration_net.id
@@ -248,12 +251,13 @@ resource "openstack_compute_instance_v2" "instances" {
 }
 
 resource "openstack_compute_volume_attach_v2" "mariadb_volume_attach" {
-  instance_id = openstack_compute_instance_v2.instances["mariadb"].id
-  volume_id   = openstack_blockstorage_volume_v3.mariadb_volume.id
+  for_each    = local.mariadb_instances
+  instance_id = openstack_compute_instance_v2.instances[each.key].id
+  volume_id   = openstack_blockstorage_volume_v3.mariadb_volume[each.key].id
 
   timeouts {
-    create = "5m"
-    delete = "5m"
+    create = "10m"
+    delete = "20m"
   }
 }
 
@@ -261,5 +265,5 @@ resource "openstack_compute_volume_attach_v2" "mariadb_volume_attach" {
 
 resource "openstack_compute_floatingip_associate_v2" "apache_fip" {
   floating_ip = var.apache_floating_ip
-  instance_id = openstack_compute_instance_v2.instances["apache"].id
+  instance_id = openstack_compute_instance_v2.instances[local.apache_instance_key].id
 }
