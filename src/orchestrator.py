@@ -821,12 +821,282 @@ def _restore_apache_play(c, containers, nfs_containers):
         "        block: |",
     ] + [f"          {_new_ip(oc.name)} {oc.name}.migration.local" for oc in containers]
 
+    html_root = "/var/www/html"
     lines += [
+        "",
+        "    - name: Creation repertoire includes si absent",
+        "      file:",
+        f"        path: {html_root}/includes",
+        "        state: directory",
+        "        mode: '0755'",
+        "",
+        "    - name: Suppression index.html Apache (evite priorite sur index.php)",
+        "      file:",
+        f"        path: {html_root}/index.html",
+        "        state: absent",
+    ]
+    lines += _php_copy_task(
+        "Patch index.php (dashboard conteneurs dynamique)",
+        f"{html_root}/index.php",
+        _INDEX_PHP,
+    )
+    lines += _php_copy_task(
+        "Patch header.php (navigation sans onglet conteneurs)",
+        f"{html_root}/includes/header.php",
+        _HEADER_PHP,
+    )
+
+    # Script de mise à jour dynamique des instances (remplace lxc-ls sur OpenStack)
+    instance_list = " ".join(c.name for c in containers)
+    ips_decl  = " ".join(f'[{c.name}]="{_new_ip(c.name)}"' for c in containers)
+    ports_map = {"apache": 80, "web1": 80, "mariadb": 3306, "db1": 3306,
+                 "backup": 22, "ftp": 21, "nfs": 2049}
+    ports_decl = " ".join(
+        f'[{c.name}]="{ports_map.get(c.name.lower(), 22)}"' for c in containers
+    )
+    update_script = (
+        "#!/bin/bash\n"
+        f"DEST=\"{html_root}/containers.json\"\n"
+        f"declare -A IPS=( {ips_decl} )\n"
+        f"declare -A PORTS=( {ports_decl} )\n"
+        "check_tcp() { timeout 2 bash -c \"echo >/dev/tcp/$1/$2\" 2>/dev/null && echo RUNNING || echo STOPPED; }\n"
+        f"order=\"{instance_list}\"\n"
+        "containers=\"[\" total=0 running=0 first=true\n"
+        "for name in $order; do\n"
+        "  ip=\"${IPS[$name]}\" port=\"${PORTS[$name]}\"\n"
+        "  state=$(check_tcp \"$ip\" \"$port\")\n"
+        "  [ \"$first\" = true ] && first=false || containers+=\",\"\n"
+        "  containers+=\"{\\\"name\\\":\\\"$name\\\",\\\"state\\\":\\\"$state\\\","
+        "\\\"autostart\\\":\\\"1\\\",\\\"groups\\\":\\\"-\\\",\\\"ipv4\\\":\\\"$ip\\\","
+        "\\\"ipv6\\\":\\\"-\\\",\\\"unprivileged\\\":\\\"false\\\"}\"\n"
+        "  total=$((total+1)); [ \"$state\" = RUNNING ] && running=$((running+1))\n"
+        "done\n"
+        "containers+=\"]\"\n"
+        "stopped=$((total-running))\n"
+        "updated=$(date '+%Y-%m-%d %H:%M:%S')\n"
+        "printf '{\"containers\":%s,\"total\":%d,\"running\":%d,\"stopped\":%d,\"updated\":\"%s\"}' "
+        "\"$containers\" \"$total\" \"$running\" \"$stopped\" \"$updated\" > \"$DEST\"\n"
+    )
+    lines += [
+        "",
+        "    - name: Depot script mise a jour instances",
+        "      copy:",
+        "        dest: /usr/local/bin/update_instances_json.sh",
+        "        mode: '0755'",
+        "        content: |",
+    ] + [f"          {l}" for l in update_script.splitlines()]
+    lines += [
+        "",
+        "    - name: Generation initiale containers.json",
+        "      command: /usr/local/bin/update_instances_json.sh",
+        "",
+        "    - name: Cron mise a jour instances (chaque minute)",
+        "      cron:",
+        "        name: update instances json",
+        "        job: /usr/local/bin/update_instances_json.sh",
+        "        user: root",
+        "",
+        "    - name: Cron mise a jour instances (30s)",
+        "      cron:",
+        "        name: update instances json 30s",
+        "        job: sleep 30 && /usr/local/bin/update_instances_json.sh",
+        "        user: root",
+    ]
+
+    lines += [
+        "",
         "    - name: Redemarrage Apache",
         "      service:",
         "        name: apache2",
         "        state: restarted",
     ]
+    return lines
+
+
+_INDEX_PHP = r"""<?php
+require_once __DIR__ . '/config.php';
+
+$jsonFile = __DIR__ . '/containers.json';
+$ctrData  = null;
+if (file_exists($jsonFile)) { $raw = @file_get_contents($jsonFile); if ($raw) $ctrData = json_decode($raw, true); }
+$containers  = $ctrData['containers'] ?? [];
+$totalCtrs   = $ctrData['total']      ?? 0;
+$runningCtrs = $ctrData['running']    ?? 0;
+
+$load    = sys_getloadavg();
+$nproc   = (int) shell_exec('nproc') ?: 1;
+$cpuPct  = round(($load[0] / $nproc) * 100, 1);
+$memRaw  = file_get_contents('/proc/meminfo');
+preg_match('/MemTotal:\s+(\d+)/i',     $memRaw, $mt);
+preg_match('/MemAvailable:\s+(\d+)/i', $memRaw, $ma);
+$memTotal = (int)($mt[1] ?? 1);
+$memAvail = (int)($ma[1] ?? 0);
+$ramPct   = round((($memTotal - $memAvail) / $memTotal) * 100, 1);
+$diskTotal = disk_total_space('/');
+$diskFree  = disk_free_space('/');
+$diskPct   = $diskTotal > 0 ? round((($diskTotal - $diskFree) / $diskTotal) * 100, 1) : 0;
+
+function barColor(float $p, int $w=60, int $d=80): string {
+    return $p >= $d ? 'red' : ($p >= $w ? 'yellow' : 'blue');
+}
+
+$hostname    = htmlspecialchars(gethostname());
+$serverIP    = htmlspecialchars($_SERVER['SERVER_ADDR'] ?? '');
+$os          = htmlspecialchars(trim(shell_exec('lsb_release -ds 2>/dev/null') ?: 'Linux'));
+$uptime      = htmlspecialchars(trim(shell_exec('uptime -p 2>/dev/null') ?: 'N/A'));
+$phpVer = htmlspecialchars(PHP_VERSION);
+
+$pdo = getDB();
+$logs = [];
+if ($pdo) {
+    try {
+        $logs = $pdo->query('SELECT * FROM monitor_logs ORDER BY created_at DESC LIMIT 5')->fetchAll();
+    } catch (PDOException $e) {}
+}
+require_once __DIR__ . '/includes/header.php';
+?>
+<div class="flex justify-between items-center mb-28" style="flex-wrap:wrap;gap:12px;">
+    <h1 class="section-title" style="margin:0;">📊 Dashboard</h1>
+    <span class="text-sm text-muted">Mise a jour : <?= date('H:i:s') ?></span>
+</div>
+
+<p class="section-title">🖥️ Etat des conteneurs / instances</p>
+<div class="grid-3 mb-28">
+<?php
+$icons = ['mariadb'=>'🗄️','db1'=>'🗄️','apache'=>'🌐','web1'=>'🌐','backup'=>'💾','ftp'=>'📂','nfs'=>'🖴'];
+foreach ($containers as $c):
+    $isRunning  = strtoupper($c['state']) === 'RUNNING';
+    $stateClass = $isRunning ? 'up' : 'down';
+    $icon       = $icons[strtolower($c['name'])] ?? '🐧';
+?>
+<div class="card service-card <?= $stateClass ?>">
+    <div class="service-header">
+        <span class="service-name"><?= $icon ?> <?= htmlspecialchars($c['name']) ?></span>
+        <span class="badge badge-<?= $stateClass ?>"><?= $isRunning ? '● Running' : '● Stopped' ?></span>
+    </div>
+    <div class="text-sm text-muted mb-6"><?= htmlspecialchars($c['ipv4'] === '-' ? 'N/A' : $c['ipv4']) ?></div>
+    <?php if ($isRunning): ?>
+    <span class="latency text-green">✅ Actif</span>
+    <?php else: ?>
+    <span class="latency text-red">⛔ Arrete</span>
+    <?php endif; ?>
+</div>
+<?php endforeach; ?>
+<?php if (empty($containers)): ?>
+<div class="alert alert-warning" style="grid-column:1/-1;">⚠️ Donnees des conteneurs indisponibles.</div>
+<?php endif; ?>
+</div>
+
+<p class="section-title mb-12">🖥️ Ressources systeme</p>
+<div class="card mb-28">
+    <div class="progress-wrap">
+        <div class="progress-label"><span>CPU (<?= $nproc ?> coeur(s))</span><span><?= $cpuPct ?> %</span></div>
+        <div class="progress-bar"><div class="progress-fill <?= barColor($cpuPct) ?>" style="width:<?= min($cpuPct,100) ?>%"></div></div>
+    </div>
+    <div class="progress-wrap">
+        <div class="progress-label"><span>RAM (<?= round($memTotal/1024) ?> Mo)</span><span><?= $ramPct ?> %</span></div>
+        <div class="progress-bar"><div class="progress-fill <?= barColor($ramPct) ?>" style="width:<?= min($ramPct,100) ?>%"></div></div>
+    </div>
+    <div class="progress-wrap" style="margin-bottom:0">
+        <div class="progress-label"><span>Disque (<?= round($diskTotal/1073741824,1) ?> Go)</span><span><?= $diskPct ?> %</span></div>
+        <div class="progress-bar"><div class="progress-fill <?= barColor($diskPct,75,90) ?>" style="width:<?= min($diskPct,100) ?>%"></div></div>
+    </div>
+</div>
+
+<p class="section-title mb-12">ℹ️ Informations systeme</p>
+<div class="card mb-28">
+    <ul class="info-list">
+        <li><span class="info-key">Hostname</span>        <span class="info-value"><?= $hostname ?></span></li>
+        <li><span class="info-key">Adresse IP</span>      <span class="info-value"><?= $serverIP ?></span></li>
+        <li><span class="info-key">Systeme</span>         <span class="info-value"><?= $os ?></span></li>
+        <li><span class="info-key">Uptime</span>          <span class="info-value"><?= $uptime ?></span></li>
+        <li><span class="info-key">Conteneurs actifs</span> <span class="info-value"><?= $runningCtrs ?>/<?= $totalCtrs ?></span></li>
+        <li><span class="info-key">PHP</span>             <span class="info-value"><?= $phpVer ?></span></li>
+    </ul>
+</div>
+
+<div class="flex justify-between items-center mb-12">
+    <p class="section-title" style="margin:0;">📋 5 derniers evenements</p>
+    <a href="/logs.php" class="text-sm text-accent">Voir tout →</a>
+</div>
+<?php if (!$pdo): ?>
+<div class="alert alert-warning">⚠️ Base de donnees indisponible.</div>
+<?php elseif (empty($logs)): ?>
+<div class="alert alert-warning">Aucun log disponible.</div>
+<?php else: ?>
+<div class="card">
+    <div class="table-wrap">
+        <table>
+            <thead><tr><th>Date</th><th>Service</th><th>Statut</th><th>Message</th></tr></thead>
+            <tbody>
+            <?php foreach ($logs as $log): ?>
+            <tr>
+                <td class="muted font-mono"><?= htmlspecialchars($log['created_at']) ?></td>
+                <td><?= htmlspecialchars($log['service']) ?></td>
+                <td><span class="badge badge-<?= htmlspecialchars($log['status']) ?>"><?= strtoupper(htmlspecialchars($log['status'])) ?></span></td>
+                <td><?= htmlspecialchars($log['message']) ?></td>
+            </tr>
+            <?php endforeach; ?>
+            </tbody>
+        </table>
+    </div>
+</div>
+<?php endif; ?>
+<script>setTimeout(()=>location.reload(),30000);</script>
+<?php require_once __DIR__ . '/includes/footer.php'; ?>"""
+
+_HEADER_PHP = r"""<?php
+$currentPage = basename($_SERVER["PHP_SELF"], ".php");
+$navItems = [
+    "index"     => ["label"=>"Dashboard", "icon"=>"📊"],
+    "services"  => ["label"=>"Services",  "icon"=>"⚙️"],
+    "logs"      => ["label"=>"Logs",      "icon"=>"📋"],
+    "migration" => ["label"=>"Migration", "icon"=>"🚀"],
+];
+?>
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title><?= htmlspecialchars(APP_NAME) ?> — <?= htmlspecialchars($navItems[$currentPage]["label"] ?? "Page") ?></title>
+    <link rel="stylesheet" href="/assets/css/style.css">
+</head>
+<body>
+<nav class="navbar">
+    <div class="navbar-brand">
+        <span class="navbar-logo">📡</span>
+        <span class="navbar-title"><?= htmlspecialchars(APP_NAME) ?></span>
+    </div>
+    <ul class="navbar-links">
+        <?php foreach ($navItems as $page => $info): ?>
+        <li>
+            <a href="/<?= $page === "index" ? "" : $page.".php" ?>"
+               class="nav-link <?= $currentPage === $page ? "active" : "" ?>">
+                <span><?= $info["icon"] ?></span> <?= htmlspecialchars($info["label"]) ?>
+            </a>
+        </li>
+        <?php endforeach; ?>
+    </ul>
+    <div class="navbar-status">
+        <span class="pulse-dot"></span>
+        <span class="status-label">Monitoring actif</span>
+    </div>
+</nav>
+<div class="container">"""
+
+
+def _php_copy_task(task_name: str, dest: str, content: str) -> list:
+    """Génère les lignes YAML d'une tâche Ansible copy pour un fichier PHP."""
+    lines = [
+        "",
+        f"    - name: {task_name}",
+        "      copy:",
+        f"        dest: {dest}",
+        "        content: |",
+    ]
+    for line in content.split('\n'):
+        lines.append(f"          {line}")
     return lines
 
 
@@ -864,6 +1134,18 @@ def _restore_nfs_play(c):
         f"        dest: {nfs_parent}/",
         "        remote_src: yes",
     ]
+
+    html_dir = f"{nfs_parent}/shared/html"
+    lines += _php_copy_task(
+        "Patch index.php (dashboard conteneurs dynamique)",
+        f"{html_dir}/index.php",
+        _INDEX_PHP,
+    )
+    lines += _php_copy_task(
+        "Patch header.php (navigation sans onglet conteneurs)",
+        f"{html_dir}/includes/header.php",
+        _HEADER_PHP,
+    )
 
     if ftp_export_path:
         lines += [
